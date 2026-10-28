@@ -1,0 +1,1627 @@
+---
+title: "EDA Template (R, beginner version)"
+output: html_document
+---
+
+```{r knitr-setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 6, fig.height = 4)
+```
+
+# EDA Template (R, beginner version)
+
+**Contents** (the big sections)
+
+0.  Packages and settings (edit here only)
+1.  Read the tables and merge
+2.  Check the structure of the data
+3.  Split: `raw` and `holdout`
+4.  Basic statistics
+5.  Distribution plots
+6.  Explore with groups
+7.  Correlation between variables
+8.  Overview of missing values
+9.  What does the missingness mean?
+10. Save the plots and tables
+11. New columns, filled missing values, and the files `raw` and `holdout`
+
+- Appendix: basic operations
+
+- Date and time
+
+- Run the chunks from top to bottom. **Change only the settings chunk (section 0)** to reuse this on other data. In section 1 you also write your own file names and joins, and in 2-3 you choose option A or option B.
+
+- **The order matters: merge the tables (1) -\> look at the structure (2) -\> cut the rows into `raw` and `holdout` (3) -\> explore `raw` only (4-10) -\> on ALL the rows (`full`): fill the missing values, make the new columns, and save `raw` and `holdout` (11).** The holdout is not used for anything until the very end of the analysis template.
+
+- Example data: the bike data (`rentals.csv`, `stations.csv`, `weather.csv`). In the code, names like `temp_c`, `station_type`, `district`, `opened_date` are written directly (they were `age`, `gender`, `region_id`, `signup_date` in the customer example). For other data, replace them with your own column names.
+
+- Plots are plain base-R plots (`hist`, `barplot`, `boxplot`, `plot`).
+
+- Sections 4-9 are the old sections 2-7 of this template. The original "section 0" reference (Series / DataFrame / select / rename ...) is the **Appendix** at the end.
+
+- Comments saying *(optional)* mark things that only make the output look nicer. You can ignore them.
+
+- The next template is `analysis_template.Rmd`. It reads the files written in section 11 (11-4), the last step.
+
+**What to change for a new data set (and where it is)**
+
+| what | where |
+|------------------------------------|------------------------------------|
+| `TARGET`, `TIME` (`NULL` = no time column), `GROUP` (`NULL` = none) | chunk `settings` (section 0) |
+| time or random split, size of the holdout | `settings`: `SPLIT`, `HOLDOUT_FRAC` |
+| time-series features of the target (lags ...), optional | `settings`: `TS_MODE`; the chunks are in 11-3 |
+| how the missing values are filled | 11-1, chunk `fill-all`: `METHOD` and the lines below it |
+| new columns (optional) | 11-2, chunk `new-columns` |
+| file names, one `read_csv` per table | 1, chunk `read-tables` |
+| which tables are joined, on which keys | 1, chunks `check-keys`, `check-unmatched`, `merge` |
+| which columns are NUM / CAT / date / id | **you choose ONE**: option A (you write the lists in `settings`) or option B (automatic), both in 2-3 |
+| the examples with column names (`temp_c`, `station_type` ...) | the chunks of sections 4-9: replace the names or skip them |
+
+## 0. Packages and settings (edit here only)
+
+```{r settings}
+# install.packages("tidyverse")        # run once if tidyverse is not installed
+library(tidyverse)
+
+options(width = 150)                   # (optional) wider printing
+options(tibble.print_max = 50)         # (optional) print up to 50 rows of a table
+options(tibble.print_min = 20)         # (optional) print at least 20 rows of a table
+options(tibble.width = Inf)            # (optional) print all columns of a table
+
+# ===== Settings =====
+SEED           <- 0
+TARGET         <- "rentals"            # the numeric outcome (y)
+TIME           <- "date"               # the time column. NULL if the data has no time column
+GROUP          <- "station_id"         # a column whose values repeat (the same station / customer / patient ...). NULL if none
+SPLIT          <- "time"               # how the holdout is made: "time" (the LAST part in time) or "random"
+HOLDOUT_FRAC   <- 0.2                  # the share of the rows (days) kept as the holdout
+TS_MODE        <- "bar"               # time-series features of the target (section 11-3): "none" | "row" (previous rows) | "bar" (previous days / hours)
+
+MISSING_TOKENS <- c("?", "unknown", "N/A", "")   # text values that really mean "missing"
+MAX_UNIQUE     <- 15                   # at most this many different values -> a category (used by option B and by the bar charts)
+
+# Option A (you decide): write the lists here. Option B (automatic) overwrites ID_COLS, DATE_COLS, NUM and CAT.
+ID_COLS        <- c("rental_id", "station_id")          # ID columns (not predictors)
+DATE_COLS      <- c("date", "opened_date")              # date columns
+CAT_NUM_COLS   <- c("district_code")                    # columns stored as numbers that are really categories
+NUM            <- c("temp_c", "feels_like_c", "humidity", "wind_kmh", "rain_mm", "day_off", "promo",
+                    "capacity", "dist_center_km", "bikes_available_am", "random_score")   # numeric predictors
+CAT            <- c("station_type", "district", "district_code", "has_charging", "weather_alert", "event_nearby", "station_color")   # categorical predictors
+# ====================
+
+HAS_TIME <- !is.null(TIME)
+if (!HAS_TIME) TS_MODE <- "none"      # no time column: no time-series features
+set.seed(SEED)
+```
+
+This chunk is a **cheat sheet** (`eval = FALSE`): run the lines you need one at a time in the console. The R names are `dplyr` / `tibble` functions unless noted.
+
+```{r cheat-sheet, eval=FALSE}
+# ===== Vector (= a pandas Series: one column) =====
+s <- c(25, 40, 31)                                   # from values
+s <- c(a = 25, b = 40, c = 31)                       # named vector (names play the role of the index)
+s["b"]; s[2]; s[s > 30]                              # by name / by position (R starts at 1!) / by condition
+
+# ===== Data frame / tibble (= a DataFrame: several columns) =====
+df <- tibble(age = c(25, 40, 31), gender = c("F", "M", "F"))             # {column = values}
+df <- tribble(~age, ~gender,  25, "F",  40, "M")                         # row by row (easy to read)
+df <- bind_rows(list(age = 25, gender = "F"), list(age = 40, gender = "M"))   # list of rows
+# df <- read_csv("file.csv")                                            # from a file
+
+# Taking ONE column out
+df$age; df[["age"]]; pull(df, age)       # -> vector (same as a Series)
+df["age"]; select(df, age)               # -> still a tibble (like df[["age"]] vs df[["age"]] in pandas)
+# CAUTION: df[, "age"] gives a vector for a data.frame but a tibble for a tibble.
+
+# ===== Selecting columns (after reading) =====
+select(df, age, gender)                              # by name
+df[c("age", "gender")]                               # base R
+select(df, -gender)                                  # everything except gender
+select(df, 1, 3)                                     # by position
+select(df, where(is.numeric))                        # by type: is.character / is.factor / is.logical / lubridate::is.Date
+select(df, contains("age"))                          # name contains "age"; also starts_with() ends_with() matches("regex")
+cols <- c("age", "gender"); select(df, all_of(cols)) # from a character vector of names (the way this template does it)
+cols <- setdiff(names(df), "customer_id")            # "all columns except ..."
+
+# ===== Renaming columns =====
+rename(df, customer_age = age, sex = gender)         # rename(NEW = OLD)  <- opposite order from pandas {old: new}
+names(df) <- c("a", "b")                             # replace all names (count and order must match)
+rename_with(df, ~ str_replace_all(str_to_lower(str_trim(.x)), " ", "_"))   # rule-based: trim, lower case, spaces -> _
+rename_with(df, ~ paste0("c_", .x))                  # add a prefix to every column;  paste0(.x, "_raw") for a suffix
+# janitor::clean_names(df) does the "snake_case" rule in one call (needs the janitor package)
+
+# ===== Reordering columns =====
+select(df, gender, age)                              # list them in the new order (only the listed ones are kept)
+relocate(df, gender)                                 # move gender to the front, keep the rest
+relocate(df, gender, .after = age)                   # put gender right after age
+
+# ===== Adding and removing columns =====
+df <- mutate(df, age2 = age * 2,                     # compute a new column
+                 flag  = 0,                          # same value in every row
+                 group = if_else(age >= 30, "old", "young"))   # conditional value (like np.where)
+# case_when(age < 20 ~ "teen", age < 60 ~ "adult", TRUE ~ "senior")   # several conditions
+df <- select(df, -age2, -flag)                       # remove columns
+s  <- df$group; df$group <- NULL                     # take a column out and remove it (like pandas pop)
+
+# ===== Changing column types =====
+mutate(df, age = as.numeric(age), gender = as.factor(gender))
+mutate(df, d = as.Date(d, format = "%Y-%m-%d"))      # %Y = 4-digit year, %y = 2-digit year, %m, %d, %H:%M:%S
+mutate(df, d = lubridate::ymd(d))                    # also ymd_hms(), mdy(), dmy(); bad values become NA with a warning
+# as.numeric("abc") gives NA with a warning -> check with is.na() afterwards
+
+# ===== Selecting rows =====
+filter(df, age > 30)                                 # by condition (NA conditions are dropped)
+df[df$age > 30, ]                                    # base R (CAUTION: NA conditions give NA rows)
+filter(df, age > 30) %>% select(age, gender)         # condition + columns
+head(df, 3); slice(df, 1:3)                          # first 3 rows / rows by position
+slice_sample(df, n = 5)                              # random 5 rows (call set.seed() first for reproducibility)
+filter(df, age %in% c(25, 31)); filter(df, between(age, 25, 35))
+
+# ===== Removing rows =====
+slice(df, -c(1, 3))                                  # drop rows 1 and 3 by position
+filter(df, !(age > 120))                             # drop rows by condition (= keep the others)
+# DANGER: df[-which(df$age > 120), ] returns ZERO rows when nothing matches. Prefer filter(df, !(age > 120)).
+
+# ===== Row names / "index" =====
+# Tibbles have no index: keep the ID as an ordinary column (merging and grouping are done with columns).
+tibble::column_to_rownames(as.data.frame(df), "customer_id")   # column -> row names (data.frame only)
+tibble::rownames_to_column(as.data.frame(df), "customer_id")   # row names -> column
+
+# ===== Selecting by string pattern (stringr) =====
+x <- c("Mouse", "Laptop", "Keyboard", "Monitor", "Headphones")
+str_starts(x, "M")                  # starts with M
+str_ends(x, "er")                   # ends with "er"
+str_detect(x, "ou")                 # contains "ou" anywhere (the pattern is a regular expression)
+str_detect(x, "^(M|L)")             # starts with M or L
+```
+
+## 1. Read the tables and merge
+
+The data often comes in several tables. They are merged into ONE table `df` (one row = one unit of analysis) **first**. Here: one row = one station on one day (`rentals`), the station information (`stations`) and the weather of the day (`weather`) are attached.
+
+| join | keeps | use it when |
+|------------------------|------------------------|------------------------|
+| `left_join(a, b)` | all rows of `a`; the columns of `b` where the key matches (NA if not) | you want to keep all rows of the main table (the usual case) |
+| `inner_join(a, b)` | only the rows whose key is in both | you want only the matched rows |
+| `full_join(a, b)` | all rows of both | you want everything |
+
+**A left join must not change the number of rows of the main table.** If it does, a key is duplicated in `b`: check the keys first.
+
+```{r read-tables}
+rentals  <- read_csv("rentals.csv")      # the main table: one row = one station on one day
+stations <- read_csv("stations.csv")     # one row = one station
+weather  <- read_csv("weather.csv")      # one row = one day
+
+# Other formats:  read_csv2("x.csv") for ";"  |  read_tsv("x.tsv") for tab  |  readxl::read_excel("x.xlsx") for Excel
+# ONE table only?  df <- read_csv("file.csv")  and go on with section 2 (skip the rest of section 1).
+
+glimpse(rentals); glimpse(stations); glimpse(weather)     # a first look at every table
+```
+
+```{r check-keys}
+# Key check: the key of the "one" side must be unique (if not, rows multiply after the merge)
+anyDuplicated(stations$station_id) == 0      # TRUE = every station_id appears once
+anyDuplicated(weather$date) == 0             # TRUE = every date appears once
+
+# If there are duplicates, keep only the first row of each key:
+stations <- distinct(stations, station_id, .keep_all = TRUE)
+```
+
+```{r check-unmatched}
+# Rows of the main table whose key is NOT in the other table (they get NA after a left join)
+nrow(anti_join(rentals, stations, by = "station_id"))
+nrow(anti_join(rentals, weather,  by = "date"))
+```
+
+```{r merge}
+df <- rentals %>%
+  left_join(stations, by = "station_id") %>%
+  left_join(weather,  by = "date")
+
+nrow(rentals); nrow(df)                        # must be the same
+stopifnot(nrow(df) == nrow(rentals))
+head(df)
+```
+
+## 2. Check the structure of the data
+
+The merged table `df` is looked at **before** the split: only its structure (types, which values exist, missing values). The distributions and relationships are explored on `raw` only (sections 4-9).
+
+### 2-1. First look
+
+```{r first-look}
+dim(df)              # number of rows and number of columns
+names(df)            # column names
+sapply(df, class)    # type of each column
+sapply(df, n_distinct)   # number of different values in each column
+head(df)             # first 6 rows
+tail(df, 3)          # last 3 rows
+glimpse(df)          # name, type and first values of every column
+```
+
+```{r look-values}
+# The different values (and how often) of every column that has few of them. Look for "?", "unknown", "N/A", the same word spelled in two ways ...
+for (col in names(df)) {
+  if (n_distinct(df[[col]]) <= MAX_UNIQUE) print(table(df[[col]], useNA = "ifany", dnn = col))
+}
+# A text column that is mostly numbers: the values that are NOT numbers (for example a "?")
+for (col in names(df)[sapply(df, is.character)]) {
+  x <- df[[col]][!is.na(df[[col]])]
+  not_num <- unique(x[is.na(suppressWarnings(as.numeric(x)))])
+  if (length(not_num) > 0 && length(not_num) < length(unique(x)) / 2) cat(col, ": mostly numbers, but these are not numbers:", not_num, "\n")
+}
+```
+
+### 2-2. Fake missing values
+
+A text that really means "missing" (`?`, `unknown`, `N/A` ...) is written in `MISSING_TOKENS` (settings); here it becomes a real `NA`. The chunk above showed which texts there are.
+
+```{r fix-tokens}
+for (col in names(df)) {
+  if (is.character(df[[col]])) df[[col]][df[[col]] %in% MISSING_TOKENS] <- NA
+}
+# One column only:  df$station_type[df$station_type %in% c("?", "unknown")] <- NA
+```
+
+### 2-3. Which columns are numeric / categorical / date / id? (choose ONE option)
+
+**Option A: you decide.** You wrote `NUM`, `CAT`, `ID_COLS`, `DATE_COLS` and `CAT_NUM_COLS` in the settings chunk. This chunk only applies them. **Run this chunk OR the chunk of option B, not both.**
+
+```{r kinds-manual}
+for (col in DATE_COLS)    df[[col]] <- as.Date(df[[col]], format = "%Y-%m-%d")   # text -> date. Other format: "%d/%m/%Y" = 31/01/2024 | "%y" = 2-digit year
+for (col in NUM)          df[[col]] <- as.numeric(df[[col]])                      # a column with a "?" was read as text: make it numbers (the fake ones are NA now)
+for (col in CAT_NUM_COLS) df[[col]] <- as.factor(df[[col]])                       # numbers that are really categories -> factor
+
+num_cols   <- c(TARGET, NUM)                                                      # numeric columns used in the EDA below (the outcome included)
+cat_cols   <- CAT
+small_cats <- cat_cols[sapply(df[cat_cols], n_distinct) <= MAX_UNIQUE]            # categories with few different values (bar charts, group summaries)
+
+num_cols; cat_cols; small_cats; DATE_COLS; ID_COLS
+sapply(df, class)
+```
+
+**Option B: automatic.** The code guesses the kinds from the data and **overwrites** `ID_COLS`, `DATE_COLS`, `NUM` and `CAT`. Run this chunk only if you do not want to write the lists yourself.
+
+```{r kinds-auto}
+# 1. text columns that are really numbers (more than 90% of the values parse as numbers, e.g. a column that had a "?") -> numeric
+for (col in names(df)) {
+  if (is.character(df[[col]])) {
+    as_num <- suppressWarnings(as.numeric(df[[col]]))
+    has_value <- !is.na(df[[col]])
+    if (any(has_value) && mean(!is.na(as_num[has_value])) > 0.9) df[[col]] <- as_num
+  }
+}
+
+# 2. text columns that look like dates (more than 90% of the values match) -> Date
+#    (read_csv already turns "2024-01-31" columns into Date; this catches the rest. Change the format if needed.)
+for (col in names(df)) {
+  if (is.character(df[[col]])) {
+    as_date <- as.Date(df[[col]], format = "%Y-%m-%d")
+    has_value <- !is.na(df[[col]])
+    if (any(has_value) && mean(!is.na(as_date[has_value])) > 0.9) df[[col]] <- as_date
+  }
+}
+
+# 3. find the ID columns: the name ends with "id" AND there are many different values
+# grepl: Check whether a string contains a pattern; ^ = starts with, $ = ends with,  ignore.case = dont distinguish lower and upper letter.
+id_like  <- grepl("id$", names(df), ignore.case = TRUE) & sapply(df, n_distinct) > MAX_UNIQUE
+id_cols  <- names(df)[id_like]
+
+# 4. numeric columns with few different values are really categories -> factor (not the outcome)
+#    (if a real number column is turned into a category by mistake, lower MAX_UNIQUE)
+few_values <- sapply(df, function(x) is.numeric(x) && n_distinct(x) <= MAX_UNIQUE)
+for (col in names(df)[few_values & !id_like & names(df) != TARGET]) df[[col]] <- as.factor(df[[col]])
+
+# 5. column kinds
+date_cols  <- names(df)[sapply(df, function(x) inherits(x, c("Date", "POSIXct")))]
+num_cols   <- setdiff(names(df)[sapply(df, is.numeric)], id_cols)               # numeric
+cat_cols   <- setdiff(names(df), c(num_cols, date_cols, id_cols))               # categorical
+small_cats <- cat_cols[sapply(df[cat_cols], n_distinct) <= MAX_UNIQUE]          # categories with few values
+
+# the lists the analysis template needs
+ID_COLS   <- id_cols
+DATE_COLS <- date_cols
+NUM       <- setdiff(num_cols, TARGET)
+CAT       <- setdiff(small_cats, GROUP)
+
+NUM; CAT; ID_COLS; DATE_COLS
+sapply(df, class)
+```
+
+### 2-4. Column summary, unique values, duplicates
+
+```{r column-summary}
+# One row per column: type / number of different values / number of missing values
+data.frame(type      = sapply(df, function(x) class(x)[1]),    # function(x) means "for each column x"
+           n_unique  = sapply(df, n_distinct),
+           n_missing = colSums(is.na(df)))
+```
+
+```{r unique-values}
+# Different values (and how often each appears) of the category-like columns:
+# categorical columns + numeric columns with at most MAX_UNIQUE different values
+few_value_nums <- num_cols[sapply(df[num_cols], n_distinct) <= MAX_UNIQUE]
+
+for (col in c(small_cats, few_value_nums)) {
+  print(table(df[[col]], useNA = "ifany", dnn = col))      # dnn = col puts the column name above the table, useNA : count NA if there exists NA.
+}
+```
+
+```{r duplicates}
+sum(duplicated(df))                         # fully duplicated rows
+for (col in ID_COLS) {
+  print(sum(duplicated(df[[col]])))         # duplicated IDs, one number per ID column
+}
+
+df[duplicated(df$rental_id), ]              # look at the duplicated rows
+# df <- distinct(df)                        # remove fully duplicated rows
+```
+
+### 2-5. (Optional) Date parts
+
+Done on a copy (`temp`), so `df` does not change.
+
+```{r date-parts}
+WEEK_ORDER <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+temp <- df
+d <- temp$opened_date                                     # the date column
+range(d, na.rm = TRUE)                                    # first and last date
+sum(is.na(d))                                             # number of missing dates
+
+temp$opened_year    <- as.numeric(format(d, "%Y"))
+temp$opened_month   <- as.numeric(format(d, "%m"))
+temp$opened_weekday <- WEEK_ORDER[as.numeric(format(d, "%u"))]      # %u: Monday = 1 ... Sunday = 7
+
+#or temp$opened_weekday <- factor(WEEK_ORDER[as.numeric(format(temp$opened_date, "%u"))], levels = WEEK_ORDER)
+temp$opened_hour    <- as.numeric(format(d, "%H"))                  # a Date has no time -> always 0
+temp$opened_is_weekend <- as.numeric(format(d, "%u")) >= 6          # TRUE for Saturday / Sunday
+
+table(factor(temp$opened_weekday, levels = WEEK_ORDER))   # number of rows per weekday, in weekday order
+table(temp$opened_month)                                  # number of rows per month
+
+# The difference between two dates is a number of days: how long the station has been open on the day of the row
+temp$station_age_days <- as.numeric(temp$date - temp$opened_date)   # (the same column is made on `full` in section 11-2, for the models)
+range(temp$station_age_days, na.rm = TRUE)                          # the shortest and the longest
+```
+
+## 3. Split: `raw` and `holdout`
+
+From here on the rows are in **two** groups:
+
+- `raw`: the rows that we explore (sections 4-10), select variables on, cross-validate and fit on.
+- `holdout`: kept aside. **Do not use it in sections 4-10.** It stays inside the table `full` (= all the rows, every row has a label `.part`: `"raw"` or `"holdout"`); the last section (11) fills the missing values and makes the new columns on `full`, so that `raw` and `holdout` get exactly the same, and only then cuts them out again and **saves** the two files.
+
+| `SPLIT` | when | how |
+|------------------------|------------------------|------------------------|
+| `"time"` | the data has a time column (`TIME`) | `holdout` = the **last** days (the last `HOLDOUT_FRAC` of the days). A day is never cut in two |
+| `"random"` | no time column, or the rows do not depend on time | `holdout` = random rows |
+
+```{r split}
+if (SPLIT == "time" && HAS_TIME) {
+  df   <- df[order(df[[TIME]]), ]                       # sort by time
+  day  <- as.Date(df[[TIME]])
+  days <- sort(unique(day))                             # the different days
+  hold_start <- days[floor(length(days) * (1 - HOLDOUT_FRAC)) + 1]     # the first day of the holdout
+  df$.part <- ifelse(day >= hold_start, "holdout", "raw")
+} else {
+  rows <- sample(nrow(df), floor(nrow(df) * (1 - HOLDOUT_FRAC)))       # random rows (the same every time: set.seed)
+  df$.part <- "holdout"
+  df$.part[rows] <- "raw"
+}
+full    <- df                                                          # ALL the rows, with the label of every row
+raw     <- full[full$.part == "raw",     names(full) != ".part"]
+holdout <- full[full$.part == "holdout", names(full) != ".part"]
+
+cat("raw:", nrow(raw), "rows | holdout:", nrow(holdout), "rows\n")
+if (HAS_TIME) cat("raw:", format(min(raw[[TIME]])), "to", format(max(raw[[TIME]])), "| holdout:", format(min(holdout[[TIME]])), "to", format(max(holdout[[TIME]])), "\n")
+
+df <- raw         # from now on df = raw: the EDA below uses df
+```
+
+## 4. Basic statistics
+
+```{r stats-numeric}
+# Numeric columns: one row per column
+round(data.frame(count  = colSums(!is.na(df[num_cols])),
+                 mean   = sapply(df[num_cols], mean,   na.rm = TRUE),     # na.rm = TRUE ignores missing values
+                 sd     = sapply(df[num_cols], sd,     na.rm = TRUE),
+                 min    = sapply(df[num_cols], min,    na.rm = TRUE),
+                 median = sapply(df[num_cols], median, na.rm = TRUE),
+                 max    = sapply(df[num_cols], max,    na.rm = TRUE)), 2)
+
+# With percentiles (5%, 25%, 50%, 75%, 95%)
+round(t(sapply(df[num_cols], quantile, probs = c(.05, .25, .5, .75, .95), na.rm = TRUE)), 2)
+
+summary(df[num_cols])        # quick version (quartiles + number of NA)
+```
+
+```{r stats-by-station_type}
+# The same statistics by station_type (rows with missing station_type are not shown)
+
+
+df %>%
+  group_by(station_type) %>%
+  summarise(n      = n(),                          # number of rows in the group (NA ages included)
+            n_age  = sum(!is.na(temp_c)),             # number of rows where temp_c is present
+            mean   = mean(temp_c, na.rm = TRUE),
+            sd     = sd(temp_c, na.rm = TRUE),
+            median = median(temp_c, na.rm = TRUE),
+            min    = min(temp_c, na.rm = TRUE),
+            max    = max(temp_c, na.rm = TRUE))
+
+aggregate(df[num_cols], by = list(station_type = df$station_type), FUN = mean,   na.rm = TRUE)
+aggregate(df[num_cols], by = list(station_type = df$station_type), FUN = sd,     na.rm = TRUE)
+aggregate(df[num_cols], by = list(station_type = df$station_type), FUN = median, na.rm = TRUE)
+aggregate(df[num_cols], by = list(station_type = df$station_type), FUN = min,    na.rm = TRUE)
+aggregate(df[num_cols], by = list(station_type = df$station_type), FUN = max,    na.rm = TRUE)
+
+# By two columns
+aggregate(df[num_cols], by = list(station_type = df$station_type, district = df$district), FUN = mean, na.rm = TRUE)
+
+# Counts
+table(df$station_type, useNA = "ifany")         # number of rows per station_type (NA is counted too)
+count(df, station_type)                         # same, as a table
+count(df, station_type, district)              # number of rows per station_type and region
+```
+
+```{r stats-categorical}
+# Categorical columns: count and percent (NA is shown as its own row)
+for (col in small_cats) {
+  counts <- table(df[[col]], useNA = "ifany", dnn = col)
+  print(cbind(count = counts, pct = round(100 * counts / nrow(df), 1)))
+}
+```
+
+```{r stats-dates}
+# Date columns: first and last date
+for (col in DATE_COLS) {
+  print(range(df[[col]], na.rm = TRUE))
+}
+```
+
+## 5. Distribution plots
+
+`las = 2` turns the labels on the axis so that they do not overlap. If category names are long (like the months below), also enlarge the bottom margin with `par(mar = c(7, 4, 4, 2))` and move the x title down with `title(xlab = "...", line = 5.5)`.
+
+```{r plots-hist}
+# Histogram of the target (it is also the first plot of the loop below, because num_cols starts with the target)
+hist(df[[TARGET]], breaks = 25, main = paste("Histogram of the target:", TARGET), xlab = TARGET, ylab = "count")
+# hist(log(df[[TARGET]] + 1), breaks = 25, main = paste("Histogram of log(", TARGET, "+ 1 )"), xlab = paste("log(", TARGET, "+ 1 )"), ylab = "count")   # (optional) if the target is skewed
+
+# Histogram of every numeric column (one plot per column)
+for (col in num_cols) {
+  hist(df[[col]], breaks = 25, main = paste("Histogram of", col), xlab = col, ylab = "count")
+}
+
+for (col in num_cols) {
+  for (g in na.omit(unique(df$station_type))) {
+    hist(df[[col]][df$station_type == g],
+         breaks = 25,
+         main = paste("Histogram of", col, "-", g),
+         xlab = col,
+         ylab = "count")
+  }
+}
+```
+
+```{r plots-bar}
+# Bar chart of every category column with few values
+for (col in small_cats) {
+  barplot(table(df[[col]], useNA = "ifany"), main = paste("Count of", col), xlab = col, ylab = "count", las = 2)
+}
+
+df$station_type <- factor(df$station_type, levels = names(sort(table(df$station_type), decreasing = TRUE)))   # the most frequent first (or: levels = c("a", "b"))
+barplot(table(df$station_type, useNA = "ifany"),
+        main = "Count of station_type", xlab = "station_type", ylab = "count")
+```
+
+```{r plots-other}
+# Boxplot: a number by category
+boxplot(temp_c ~ station_type, data = df, main = "temp_c by station_type", xlab = "station_type", ylab = "temp_c")
+
+# A number over time
+plot(df$opened_date, df$temp_c, main = "temp_c over time", xlab = "opened_date", ylab = "temp_c")
+
+# Number of rows per month
+# Long labels need room: make the bottom margin bigger (mar) and put the x title lower (line = 5.5), so nothing overlaps.
+par(mar = c(7, 4, 4, 2))
+barplot(table(format(df$opened_date, "%Y-%m")), main = "rows per month", xlab = "", ylab = "count", las = 2, cex.names = 0.7)
+title(xlab = "month", line = 5.5)
+par(mar = c(5, 4, 4, 2))                      # back to the default margins
+```
+
+### 5-1. The target over time (month)
+
+x = the month, y = the target. One point per month: the **mean** of the target over all the rows of that month. To use the **day** instead of the month, use the `# day` line and comment out the `# month` line. ggplot chooses the x labels itself, and `check.overlap` leaves out any label that would overlap.
+
+```{r plot-target-time}
+if (HAS_TIME) {
+  tmp <- df                                                                   # a copy: df does not change
+  tmp$period <- lubridate::floor_date(as.Date(tmp[[TIME]]), "month")          # month: the first day of the month of every row
+  # tmp$period <- as.Date(tmp[[TIME]])                                        # day: use this line INSTEAD of the line above
+  tmp_mean <- aggregate(list(y = tmp[[TARGET]]), by = list(period = tmp$period), FUN = mean, na.rm = TRUE)   # the mean of the target in every period
+  ggplot(tmp_mean, aes(x = period, y = y)) +
+    geom_line() + geom_point() +
+    scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m", guide = guide_axis(check.overlap = TRUE)) +
+    labs(x = "period", y = paste("mean of", TARGET), title = paste("Mean of", TARGET, "by period"))
+}
+```
+
+### 5-2. (Optional) The target over time, one color per category
+
+Like 5-1 (x = the month, y = the mean of the target), but with **one line of its own color for every value of a category column**, all in ONE plot. Write the category column in `GROUP_VAR` (the only line to edit). The chunk names a specific column, so it is `eval = FALSE`: it is not run when you knit. For the day instead of the month, use the `# day` line and comment out the `# month` line. With many values (more than 8-10) the lines are hard to read: pick a column with few values.
+
+```{r plot-target-time-color, eval=FALSE}
+GROUP_VAR <- "station_type"      # <-- CHANGE HERE: the categorical column to color by (the only line you need to edit)
+
+if (HAS_TIME) {
+  tmp <- df                                                                   # a copy: df does not change
+  tmp$period <- lubridate::floor_date(as.Date(tmp[[TIME]]), "month")          # month: the first day of the month of every row
+  # tmp$period <- as.Date(tmp[[TIME]])                                        # day: use this line INSTEAD of the line above
+  tmp$grp <- as.character(tmp[[GROUP_VAR]])                                   # the group of every row (a 0/1 number works too)
+  tmp$grp[is.na(tmp$grp)] <- "NA"                                             # missing group = its own color (delete this line to drop it)
+  tmp_mean <- aggregate(list(y = tmp[[TARGET]]), by = list(period = tmp$period, grp = tmp$grp), FUN = mean, na.rm = TRUE)   # the mean of the target per period and per group
+  ggplot(tmp_mean, aes(x = period, y = y, color = grp)) +                     # color = one line per group
+    geom_line() + geom_point() +
+    scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m", guide = guide_axis(check.overlap = TRUE)) +
+    labs(x = "period", y = paste("mean of", TARGET), color = GROUP_VAR, title = paste("Mean of", TARGET, "by period and", GROUP_VAR))
+}
+```
+
+### 5-3. The target against every numeric column
+
+x = a numeric column, y = the target: one scatter plot per numeric column (the target itself is skipped). The red line is a smooth trend (`lowess`). (`pairs()` in section 7 has the same pictures, but too small to read.)
+
+```{r plot-target-num}
+for (col in setdiff(num_cols, TARGET)) {
+  ok <- complete.cases(df[[col]], df[[TARGET]])                    # the rows where both values are present
+  plot(df[[col]][ok], df[[TARGET]][ok], pch = 16, cex = 0.5, col = rgb(0, 0, 0, 0.3),
+       main = paste(TARGET, "vs", col), xlab = col, ylab = TARGET)
+  lines(lowess(df[[col]][ok], df[[TARGET]][ok]), col = "red")      # (optional) the trend
+}
+```
+
+### 5-4. The target against every category column
+
+x = a category column, y = the target: one boxplot per category column (only the columns with few different values, `small_cats`). The labels are turned (`las = 2`) and the bottom margin is bigger, so they do not overlap.
+
+```{r plot-target-cat}
+for (col in setdiff(small_cats, TARGET)) {
+  par(mar = c(8, 4, 4, 2))                                                    # a bigger bottom margin for the category names
+  boxplot(df[[TARGET]] ~ df[[col]], main = paste(TARGET, "by", col), xlab = "", ylab = TARGET, las = 2, cex.axis = 0.8)
+  title(xlab = col, line = 6.5)                                               # the x title lower, so nothing overlaps
+  par(mar = c(5, 4, 4, 2))                                                    # back to the default margins
+}
+```
+
+### 5-5. (Optional) The target with two or three other variables
+
+Plots of **3 or more variables** (the target + 2 or 3 others) with `ggplot2`: `color`, `fill`, `facet_wrap`. Every chunk below names **specific columns** (`temp_c`, `station_type` ... of the bike data), so they are `eval = FALSE`: **they are not run when you knit**. Copy the chunk, write your own column names, and run it by hand. The target is always `.data[[TARGET]]` (it comes from the settings: nothing to change).
+
+| chunk | x | y | color / fill | facet | the kinds of variables |
+|---|---|---|---|---|---|
+| A | number | target | category | none | number x number (the target) x category |
+| B | number | target | category | category | number x number (the target) x category x category |
+| C | category | target | category | none | category x category x number (the target) |
+| D | number | number | the target | category | number x number x number (the target) x category |
+
+Other ways to add a variable: `shape =`, `size =`, `facet_grid(row ~ column)`. A 0/1 number that is really a category: write `factor(promo)` (otherwise ggplot uses a color gradient).
+
+```{r plot-3var-a, eval=FALSE}
+# (optional) A: a number (x) and the target (y), colored by a category: is the slope different in every category?
+ggplot(df, aes(x = temp_c, y = .data[[TARGET]], color = station_type)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_smooth(se = FALSE) +                                        # one smooth curve per category (method = "lm" for a straight line)
+  labs(x = "temp_c", y = TARGET, color = "station_type", title = paste(TARGET, "vs temp_c, by station_type"))
+```
+
+```{r plot-3var-b, eval=FALSE}
+# (optional) B: the same as A, cut in panels by a second category (facet_wrap)
+ggplot(df, aes(x = temp_c, y = .data[[TARGET]], color = station_type)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_smooth(se = FALSE) +
+  facet_wrap(~ weather_alert) +                                    # one panel per weather_alert (NA gets its own panel)
+  labs(x = "temp_c", y = TARGET, color = "station_type", title = paste(TARGET, "vs temp_c, by station_type and weather_alert"))
+```
+
+```{r plot-3var-c, eval=FALSE}
+# (optional) C: two categories and the target: boxplots side by side (x = one category, fill = the other one)
+ggplot(df, aes(x = station_type, y = .data[[TARGET]], fill = has_charging)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +       # tilted labels: they do not overlap
+  labs(x = "station_type", y = TARGET, fill = "has_charging", title = paste(TARGET, "by station_type and has_charging"))
+```
+
+```{r plot-3var-d, eval=FALSE}
+# (optional) D: two numbers (x and y) and the target as the COLOR, cut in panels by a category
+ggplot(df, aes(x = temp_c, y = humidity, color = .data[[TARGET]])) +
+  geom_point(alpha = 0.6, size = 1) +
+  scale_color_viridis_c() +                                        # the color scale of the target
+  facet_wrap(~ station_type) +
+  labs(x = "temp_c", y = "humidity", color = TARGET, title = paste(TARGET, "by temp_c and humidity, by station_type"))
+```
+
+## 6. Explore with groups
+
+```{r group-numeric}
+# Summary of every numeric column by every category column (here: the mean).
+# Change mean to sd / median / min / max to get the other statistics.
+for (col in small_cats) {
+  print(col)                                                   # the name of the category column
+  print(aggregate(df[num_cols], by = list(df[[col]]), FUN = mean, na.rm = TRUE))     # Group.1 = the categories
+}
+```
+
+```{r group-named}
+# Writing it by hand, you choose the output names:
+df %>%
+  group_by(station_type) %>%
+  summarise(avg_age = mean(temp_c, na.rm = TRUE),
+            sd_age  = sd(temp_c, na.rm = TRUE),
+            n       = n())
+```
+
+```{r group-two}
+# Two categories together
+table(df$station_type, df$district)                                          # cross table (counts)
+round(prop.table(table(df$station_type, df$district), margin = 1), 2)        # share inside each station_type (rows sum to 1)
+
+# Mean of temp_c for each station_type x region (pivot table)
+round(tapply(df$temp_c, list(df$station_type, df$district), mean, na.rm = TRUE), 2)
+```
+
+## 7. Correlation between variables
+
+Needs at least 2 numeric columns.
+
+```{r corr}
+if (length(num_cols) >= 2) {
+  corr <- cor(df[num_cols], use = "pairwise.complete.obs")     # use all rows that are available for each pair
+  print(round(corr, 2))
+
+  pairs(df[num_cols], main = "Scatter plots of every pair")    # scatter plots of every pair
+  heatmap(corr, symm = TRUE, Rowv = NA, Colv = NA, margins = c(8, 8), main = "Correlation")   # (optional) colored table of the correlations
+  pal <- colorRampPalette(c("blue", "white", "red"))(101)      # the colors of the next heatmap: blue = -1, white = 0, red = +1
+  heatmap(corr, symm = TRUE, Rowv = NA, Colv = NA, margins = c(10, 10), col = pal,
+          breaks = seq(-1, 1, length.out = 102), main = "Correlation (red = +, blue = -)")
+  legend("topleft", legend = c("+1", "0", "-1"), fill = c("red", "white", "blue"),
+         title = "corr", bty = "n", cex = 0.9)   # (optional) colored table of the correlations
+}
+```
+
+```{r corr-pairs}
+# The most correlated pairs (absolute value)
+if (length(num_cols) >= 2) {
+  corr_abs <- abs(cor(df[num_cols], use = "pairwise.complete.obs"))
+  corr_abs[lower.tri(corr_abs, diag = TRUE)] <- NA             # keep every pair only once
+  pair_table <- as.data.frame(as.table(corr_abs))              # long table: Var1, Var2, Freq (= correlation)
+  pair_table <- pair_table[!is.na(pair_table$Freq), ]          # remove the NA rows
+  head(pair_table[order(-pair_table$Freq), ], 10)              # sort from the largest, show 10
+}
+```
+
+## 8. Overview of missing values
+
+Everything below runs on `df`. Pandas names are in the comments. `head(...)` is used where the result has one value per row (otherwise it would print hundreds of lines).
+
+```{r missing-by-column}
+# ===== By column =====
+head(is.na(df))                                  # TRUE/FALSE per cell, TRUE = missing   (df.isna())
+colSums(is.na(df))                               # number of missing per column          (isna().sum())
+colMeans(is.na(df))                              # share of missing per column, 0 to 1   (isna().mean())
+colSums(!is.na(df))                              # number of non-missing per column      (notna().sum())
+colSums(is.na(df)) > 0                           # does the column have any missing?     (isna().any())
+colSums(is.na(df)) == nrow(df)                   # is the whole column missing?          (isna().all())
+sum(is.na(df))                                   # total number of missing cells         (isna().sum().sum())
+sort(colSums(is.na(df)), decreasing = TRUE)      # columns with the most missing first
+```
+
+```{r missing-by-row}
+# ===== By row =====
+head(rowSums(is.na(df)))                         # number of missing per row             (isna().sum(axis=1))
+head(rowMeans(is.na(df)))                        # share of missing per row
+head(rowSums(is.na(df)) > 0)                     # row has at least one missing?         (isna().any(axis=1))
+head(rowSums(is.na(df)) == ncol(df))             # whole row is missing?                 (isna().all(axis=1))
+head(complete.cases(df))                         # row has NO missing?                   (notna().all(axis=1))
+table(rowSums(is.na(df)))                        # how many rows have 0, 1, 2, ... missing values
+
+# ===== Counts in one line =====
+sum(rowSums(is.na(df)) > 0)                      # number of rows with missing values
+sum(complete.cases(df))                          # number of rows without missing values
+nrow(drop_na(df))                                # same number, using drop_na  : remove rows with missing value
+sum(is.na(df$temp_c))                               # number of missing in the temp_c column
+mean(is.na(df$temp_c))                              # share of missing in the temp_c column
+```
+
+```{r missing-names}
+# ===== Column names =====
+names(df)[colSums(is.na(df)) > 0]                # columns that have missing values
+names(df)[colSums(is.na(df)) == 0]               # columns without missing values
+names(df)[colMeans(is.na(df)) > 0.3]             # columns with more than 30% missing
+
+# ===== Look at rows =====
+filter(df, is.na(temp_c))                           # rows where temp_c is missing
+filter(df, !is.na(temp_c))                          # rows where temp_c is present
+df[rowSums(is.na(df)) > 0, ]                     # rows with at least one missing value
+df[complete.cases(df), ]                         # rows without any missing value
+df[rowSums(is.na(df)) == ncol(df), ]             # rows where everything is missing
+df[rowSums(is.na(df)) >= 3, ]                    # rows with 3 or more missing values
+filter(df, is.na(temp_c) | is.na(station_type))           # temp_c OR station_type is missing
+filter(df, !is.na(temp_c) & !is.na(station_type))         # temp_c AND station_type are both present
+```
+
+```{r missing-fix}
+# ===== Drop / fill (done on copies, so df does not change) =====
+temp <- drop_na(df)                              # drop rows with any missing value
+temp <- drop_na(df, temp_c)                         # drop rows where temp_c is missing
+# drop_na(df, temp_c, income, station_type)
+temp <- df[rowSums(is.na(df)) < ncol(df), ]      # drop rows that are completely missing
+temp <- df[rowSums(!is.na(df)) >= 4, ]           # keep rows with at least 4 non-missing values
+temp <- df[colSums(is.na(df)) == 0]              # drop the columns that have missing values
+
+temp <- df
+temp$temp_c[is.na(temp$temp_c)] <- median(df$temp_c, na.rm = TRUE)       # fill temp_c with the median
+temp$station_type <- as.character(temp$station_type)                  # a factor cannot get a new word: make it text first
+temp$station_type[is.na(temp$station_type)] <- "Unknown"        # fill station_type with a word
+temp <- replace_na(mutate(df, station_type = as.character(station_type)), list(temp_c = 0, station_type = "Unknown"))   # fill several columns at once
+```
+
+```{r missing-summary}
+# ===== Count and percent per column =====
+s <- colSums(is.na(df))                          # number of missing per column
+s                                                # all columns
+s[s > 0]                                         # only columns that have missing values
+sort(s[s > 0], decreasing = TRUE)                # ... most missing first
+sum(s > 0)                                       # number of columns with missing values
+ncol(df)                                         # total number of columns
+colMeans(is.na(df)) * 100                        # percent missing per column
+
+# ===== Rows: how many rows have missing values? =====
+row_miss <- rowSums(is.na(df))                   # number of missing per row
+sum(row_miss > 0)                                # rows with at least one missing
+mean(row_miss > 0) * 100                         # ... as a percent
+sum(row_miss == 0)                               # rows without any missing
+table(row_miss)                                  # rows with 0, 1, 2, ... missing values
+```
+
+```{r missing-pattern}
+# ===== Missing patterns: which columns are missing together? =====
+cols_na <- names(df)[colSums(is.na(df)) > 0]     # columns that have missing values
+
+# Pattern table: TRUE = missing. Each row is one pattern, Freq = number of rows with that pattern.
+# (With many columns this table gets very large. Use only a few columns then.)
+pattern <- as.data.frame(table(as.data.frame(is.na(df[cols_na]))))
+pattern[pattern$Freq > 0, ]
+
+round(cor(is.na(df[cols_na])), 2)                # near 1 = the columns are missing together
+table(age_missing = is.na(df$temp_c), gender_missing = is.na(df$station_type))   # two columns only
+
+```
+
+```{r missing-cat-combo}
+# ===== Which CATEGORICAL columns are missing together, and does the TARGET differ between the combinations? =====
+N_COMBO  <- 3                                                           # <-- CHANGE HERE (optional): how many categorical columns to combine (2 or 3)
+miss_n   <- sort(colSums(is.na(df[cat_cols])), decreasing = TRUE)       # the number of missing values of every categorical column, the highest first
+miss_n   <- miss_n[miss_n > 0]
+miss_n                                                                  # (look at it: the columns with the most missing values come first)
+MISS_CAT <- names(head(miss_n, N_COMBO))                                # the N_COMBO categorical columns with the most missing values
+# MISS_CAT <- c("station_type", "weather_alert")                        # (optional) or write the columns you want yourself
+
+if (length(MISS_CAT) >= 1) {
+  ind_cols <- paste0(MISS_CAT, "_missing")                              # TRUE = missing, FALSE = present
+  tab <- df[TARGET]
+  for (j in seq_along(MISS_CAT)) tab[[ind_cols[j]]] <- is.na(df[[MISS_CAT[j]]])
+  combo <- tab %>%
+    group_by(across(all_of(ind_cols))) %>%                              # every combination of missing / present
+    summarise(n           = n(),                                        # number of rows
+              pct         = round(100 * n() / nrow(df), 1),             # share of the rows (%)
+              target_mean = if (is.numeric(.data[[TARGET]])) round(mean(.data[[TARGET]], na.rm = TRUE), 2) else NA_real_,   # mean of the TARGET in this combination
+              .groups = "drop") %>%
+    arrange(desc(n))                                                    # the most frequent combination first
+  none_missing <- combo$target_mean[rowSums(as.matrix(combo[ind_cols])) == 0]       # the TARGET mean when none of these columns is missing
+  combo$diff_vs_none_missing <- if (length(none_missing) == 1) round(combo$target_mean - none_missing, 2) else NA_real_   # the difference from that
+  print(as.data.frame(combo))
+} else {
+  cat("no categorical column has missing values\n")
+}
+```
+
+```{r missing-picture}
+# Picture of the missing cells: red = missing, white = present. One column per variable, one line per row.
+image(x = 1:length(cols_na), y = 1:nrow(df), z = t(is.na(df[cols_na])) * 1,
+      col = c("white", "red"), axes = FALSE, xlab = "column", ylab = "row", main = "Missing cells (red)")
+axis(1, at = 1:length(cols_na), labels = cols_na)
+```
+
+## 9. What does the missingness mean?
+
+Compare the rows where a column is missing with the rows where it is not.
+
+```{r missing-meaning}
+df$days_since_signup <- as.numeric(max(df$opened_date) - df$opened_date)
+num_cols <- c(num_cols, "days_since_signup")         # add it to the list of numeric columns
+num_cols
+col <- "temp_c"                          # the column to investigate (change it to the column you care about)
+m <- is.na(df[[col]])                 # TRUE if missing, FALSE if present (one value per row)
+others <- setdiff(num_cols, col)      # the other numeric columns used for the comparison
+
+# 1. Numeric columns: mean in the missing group and in the present group
+if (length(others) > 0) {
+  mean_missing <- sapply(df[m, others],  mean, na.rm = TRUE)
+  mean_present <- sapply(df[!m, others], mean, na.rm = TRUE)
+  print(data.frame(mean_missing, mean_present))
+  
+  mean_present2 <- mean_present[names(mean_missing)]     # following the same order as mean_missing
+  data.frame(mean_missing, mean_present = mean_present2)
+
+  # (mean of missing group - mean of present group) / overall sd
+  # The larger the absolute value, the bigger the difference (below 0.2: tiny, above 0.8: large)   #This standard is proposed by Cohen 
+  print(round((mean_missing - mean_present) / sapply(df[others], sd, na.rm = TRUE), 3)) 
+}
+```
+
+```{r missing-meaning-cat}
+# 2. Categorical columns: missing rate by group (TRUE counts as 1, so the mean is the share)
+tapply(m, df$district, mean)                            # share of missing in each region
+tapply(m, df$station_type, mean)                               # share of missing for each station_type
+
+table(df$district, m)                                   # counts (columns: FALSE = present, TRUE = missing)
+round(prop.table(table(df$district, m), margin = 1), 3) # share inside each region (rows sum to 1)
+```
+
+```{r missing-meaning-levels}
+# 2b. The levels of the other categorical columns inside the two groups: the rows where `col` is missing (TRUE) and the rows where it is present (FALSE)
+#     (uses `col` and `m` of the chunk missing-meaning above. Every group adds up to 100%: a level that is more common in one group shows up in the diff column)
+if (sum(m) > 0 && sum(!m) > 0) {
+  for (cc in setdiff(small_cats, col)) {
+    tab  <- table(df[[cc]], m, useNA = "ifany")                          # counts: rows = the levels, columns = FALSE (present) / TRUE (missing)
+    pct  <- round(100 * prop.table(tab, margin = 2), 1)                  # % inside each group (every column adds up to 100)
+    lv   <- rownames(pct);  lv[is.na(lv)] <- "NA"                        # a missing level is shown as "NA"
+    rownames(pct) <- lv
+    show <- data.frame(level = lv, present = as.numeric(pct[, "FALSE"]), missing = as.numeric(pct[, "TRUE"]))
+    show$diff <- show$missing - show$present                             # in % points: + = more common among the missing rows
+    cat("\n", cc, ": share of every level inside the two groups (%)\n")
+    print(show, row.names = FALSE)
+
+    par(mar = c(8, 4, 4, 2))                                             # a bigger bottom margin for the level names
+    barplot(t(pct), beside = TRUE, las = 2, cex.names = 0.8, ylim = c(0, max(pct) * 1.25), legend.text = c("present", "missing"),
+            main = paste(cc, ": share inside each group,", col, "present vs missing"), ylab = "% of the group")
+    par(mar = c(5, 4, 4, 2))                                             # back to the default margins
+  }
+} else {
+  cat(col, "has no missing values (or only missing values): nothing to compare\n")
+}
+```
+
+```{r missing-meaning-time}
+# 3. Change over time: share of missing (%) in each signup month
+month <- format(df$opened_date, "%Y-%m")
+missing_by_month <- tapply(m, month, mean) * 100
+round(missing_by_month, 1)
+par(mar = c(7, 4, 4, 2))                      # bigger bottom margin for the long month labels
+barplot(missing_by_month, las = 2, cex.names = 0.7, xlab = "", ylab = "% missing", main = paste("missing", col, "by month"))
+title(xlab = "month", line = 5.5)
+par(mar = c(5, 4, 4, 2))                      # back to the default margins
+```
+
+```{r missing-over-time}
+# 3b. Missing over time: x = the month of the TIME column. For the day instead of the month: use the `# day` line and comment out the `# month` line.
+if (HAS_TIME) {
+  period <- lubridate::floor_date(as.Date(df[[TIME]]), "month")           # month: the first day of the month of every row
+  # period <- as.Date(df[[TIME]])                                         # day: use this line INSTEAD of the line above
+
+  # (1) the share of the rows where a column is missing, in every month: one line per column
+  MISS_COLS <- names(which(colSums(is.na(df[c(NUM, CAT)])) > 0))         # <-- CHANGE HERE (optional): the columns to draw, for example c("temp_c", "station_type")
+  if (length(MISS_COLS) > 0) {
+    share <- NULL
+    for (cn in MISS_COLS) {
+      s     <- tapply(is.na(df[[cn]]), period, mean)                      # the share of missing values in every month (0 to 1)
+      share <- rbind(share, data.frame(period = as.Date(names(s)), share = as.numeric(s), column = cn))
+    }
+    print(ggplot(share, aes(x = period, y = share, color = column)) +
+      geom_line() + geom_point() +
+      scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m", guide = guide_axis(check.overlap = TRUE)) +
+      labs(x = "period", y = "share of the rows that are missing", title = "Missing over time, one line per column"))
+  }
+
+  # (2) the mean number of missing columns per row, in every month
+  n_miss <- rowSums(is.na(df[c(NUM, CAT)]))                               # the number of missing columns of every row (the predictors)
+  avg    <- tapply(n_miss, period, mean)                                  # the mean of it in every month
+  avg_df <- data.frame(period = as.Date(names(avg)), mean_missing = as.numeric(avg))
+  print(ggplot(avg_df, aes(x = period, y = mean_missing)) +
+    geom_line() + geom_point() +
+    scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m", guide = guide_axis(check.overlap = TRUE)) +
+    labs(x = "period", y = "mean number of missing columns per row", title = "Missing columns per row over time"))
+} else {
+  cat("there is no time column\n")
+}
+```
+
+```{r missing-meaning-other}
+# 4. Relation with the missingness of the other columns
+cor(is.na(df[cols_na]))
+round(cor(is.na(df[cols_na]))[col, ], 3)                 # near 1 = missing together with that column
+table(this_col = m, other_col = is.na(df$station_type))        # combinations of missing / present
+```
+
+## 10. Save the plots and tables
+
+The plots above only exist on the screen (or in the knitted html). This section writes the main plots as **png files** and the main tables as **csv files** into the folder `OUT_DIR`. Everything is made from `df` (= `raw`).
+
+```{r save-setup}
+OUT_DIR <- "eda_output"                       # the folder (it is created if it does not exist)
+dir.create(OUT_DIR, showWarnings = FALSE)
+if (exists("df_backup")) df <- df_backup      # section 8 made some values missing on purpose (practice): go back to the copy made before that
+num_cols <- intersect(num_cols, names(df))    # (a column added in section 9 is not in df_backup)
+```
+
+```{r save-tables}
+# one row per column: type / number of different values / number of missing values
+write.csv(data.frame(type      = sapply(df, function(x) class(x)[1]),
+                     n_unique  = sapply(df, n_distinct),
+                     n_missing = colSums(is.na(df))), file.path(OUT_DIR, "columns.csv"))
+
+# mean, sd, min, median, max of the numeric columns
+write.csv(round(data.frame(mean   = sapply(df[num_cols], mean,   na.rm = TRUE),
+                           sd     = sapply(df[num_cols], sd,     na.rm = TRUE),
+                           min    = sapply(df[num_cols], min,    na.rm = TRUE),
+                           median = sapply(df[num_cols], median, na.rm = TRUE),
+                           max    = sapply(df[num_cols], max,    na.rm = TRUE)), 3), file.path(OUT_DIR, "stats_numeric.csv"))
+
+# correlation of the numeric columns
+write.csv(round(cor(df[num_cols], use = "pairwise.complete.obs"), 3), file.path(OUT_DIR, "correlation.csv"))
+
+list.files(OUT_DIR)
+```
+
+```{r save-plots}
+# a histogram of every numeric column
+for (col in num_cols) {
+  png(file.path(OUT_DIR, paste0("hist_", col, ".png")), width = 700, height = 500)
+  hist(df[[col]], main = paste("Histogram of", col), xlab = col, ylab = "count")
+  dev.off()
+}
+
+# a bar chart of every category column with few values
+for (col in small_cats) {
+  png(file.path(OUT_DIR, paste0("bar_", col, ".png")), width = 700, height = 500)
+  barplot(table(df[[col]], useNA = "ifany"), main = paste("Count of", col), xlab = col, ylab = "count")
+  dev.off()
+}
+
+# the target by every category column with few values
+for (col in setdiff(small_cats, TARGET)) {
+  png(file.path(OUT_DIR, paste0("box_", TARGET, "_by_", col, ".png")), width = 700, height = 500)
+  boxplot(df[[TARGET]] ~ df[[col]], main = paste(TARGET, "by", col), xlab = col, ylab = TARGET)
+  dev.off()
+}
+
+# the target over time
+if (HAS_TIME) {
+  png(file.path(OUT_DIR, "target_over_time.png"), width = 700, height = 500)
+  plot(df[[TIME]], df[[TARGET]], main = paste(TARGET, "over time"), xlab = TIME, ylab = TARGET)
+  dev.off()
+}
+
+list.files(OUT_DIR)
+```
+
+## 11. New columns, filled missing values, and the files `raw` and `holdout`
+
+This last section works on **`full`** (all the rows: `raw` and `holdout` together, every row has the label `.part`). Doing the work on `full` gives `raw` and `holdout` **exactly the same** values. **Run it after the EDA** (sections 4-10): the EDA was done on `raw` with its missing values.
+
+1.  **11-1** fill the missing values (ONE method);
+2.  **11-2** (optional) make new columns;
+3.  **11-3** (optional) make time-series features;
+4.  **11-4** cut `raw` and `holdout` out of `full` again and **save** the two files (the analysis template reads them).
+
+**Why this does not use the holdout:** the time methods of the fill only look at rows **before** the row (for a holdout row: `raw` and the earlier days of the holdout, which is what you know at that time); `"all"` learns its number on the `raw` rows only; a new column is computed from the row itself; the time-series features use only the past. **Never use `TARGET` to make a predictor** (except its past values in 11-3). The only small look-aheads stay **inside `raw`** (never the holdout): the first time unit of `"time_window"` uses the first `FIRST_K` raw values, and the fallback `"overall"` uses the overall value of the raw rows.
+
+### 11-1. Fill the missing values
+
+A model cannot use a row that has a missing value. They are filled with ONE method, in the table `full`. The outcome (`TARGET`) is never filled. Choose the method in the chunk (`METHOD`); with no time column only `"all"` is possible.
+
+```{r fill-all}
+df       <- full                                    # the code below works on a table called df
+if (HAS_TIME) df <- df[order(df[[TIME]]), ]         # sorted by time (the time methods need it)
+raw_rows <- which(df$.part == "raw")                # the rows of raw: "all" learns its number on them only
+df_mean  <- df
+
+# ===== How to fill the missing values (choose here) =====
+METHOD      <- "time_window"   # "all" | "expanding" | "time_window" | "last_k" | "same_time"
+WINDOW_DAYS <- 30              # for "time_window": how many past time units (days) it looks back at the end (30 = the past 30 days). The rule is written above the time_window code
+FIRST_K     <- 10              # for "time_window": the first time unit has no past, so it uses the first FIRST_K observed values of the raw rows (a small look-ahead, only for that unit)
+K           <- 10              # for "last_k": use the last K observed values
+FALLBACK    <- "overall"       # when there is still nothing to use: "overall" (the overall mean / most common value of the raw rows) | "none"
+SAME_WEEKDAY <- TRUE           # "expanding": TRUE = only use the rows with the SAME weekday as this row (weekdays often behave alike)
+UNIT        <- "day"           # "week" | "day" | "hour"      the unit of time
+if (!HAS_TIME) METHOD <- "all" # no time column: only "all" is possible
+
+# METHOD: which observed values of the same column are used to fill a missing value
+#   "all"         : every observed value of the RAW rows (the number is learned on raw only; the holdout gets the same number).
+#   "expanding"   : all observed values BEFORE this row's time        (everything known so far)
+#   "time_window" : the first time unit has no past                 = the mean of the first FIRST_K observed values of the column
+#                   time unit 2 up to WINDOW_DAYS                   = the mean of ALL the observed values before this row's time
+#                   after that                                      = the mean of the observed values of the past WINDOW_DAYS time units only
+#                   (the exact rule, with an example, is written above the time_window code below)
+#   "last_k"      : the last K observed values before this row        (rows are sorted by time)
+#   "same_time"   : the other rows with the SAME time as this row     (a cross-section; use it only if they are known at the same moment)
+# The four time methods need the table to be sorted by time (it is). They only use OBSERVED values: a filled value never fills another one.
+# FALLBACK: if there is still nothing to use (for example the whole window is missing), "overall" uses the overall mean (categorical: the most
+#           common value) of the RAW rows (a small look-ahead inside raw, never the holdout), "none" leaves the value missing.
+#
+# Numeric columns are filled with the MEAN. For the MEDIAN, change  mean(  to  median(  in the lines marked  <-- mean.
+# Categorical columns are filled with the most common value.
+
+# most_common(x) returns the most frequent value of x (a function is a saved recipe)
+most_common <- function(x) {
+  counts <- table(x)
+  names(counts)[which.max(counts)]
+}
+
+# overall_of(x): the observed values of the RAW rows (the fallback uses their mean / most common value)
+overall_of <- function(x) {
+  v <- x[raw_rows]
+  v[!is.na(v)]
+}
+
+if (METHOD != "all") {
+  t0 <- lubridate::floor_date(min(df[[TIME]]), UNIT, week_start = 1)               # the start of the first week (Monday) / day / hour
+  tm <- floor(as.numeric(difftime(df[[TIME]], t0, units = paste0(UNIT, "s"))))     # whole weeks / days / hours since then
+  wd <- format(df[[TIME]], "%u")                                                   # weekday number: Monday = 1 ... Sunday = 7
+}
+
+# ---------- METHOD = "all": every observed value of RAW ----------
+if (METHOD == "all") {
+  for (col in NUM) df_mean[[col]][is.na(df[[col]])] <- mean(df[[col]][raw_rows], na.rm = TRUE)     # <-- mean
+  for (col in CAT) df_mean[[col]][is.na(df[[col]])] <- most_common(df[[col]][raw_rows])
+}
+
+# ---------- METHOD = "expanding": observed values before this row's time ----------
+if (METHOD == "expanding") {
+  for (col in c(NUM, CAT)) {
+    x <- df[[col]]                                   # the ORIGINAL values: filled values are never used to fill other rows
+    for (i in which(is.na(x))) {                     # every row where this column is missing
+      ok <- tm < tm[i]                               # rows before this row's time
+      if (SAME_WEEKDAY) ok <- ok & wd == wd[i]       # ... and only the rows with the same weekday
+      pool <- x[ok]                                  # their values
+      pool <- pool[!is.na(pool)]                     # only observed values
+      if (length(pool) == 0 && FALLBACK == "overall") pool <- overall_of(x)   # nothing in the past: the overall value of raw
+      if (length(pool) > 0 &&  is.numeric(x)) df_mean[[col]][i] <- mean(pool)                  # <-- mean
+      if (length(pool) > 0 && !is.numeric(x)) df_mean[[col]][i] <- most_common(pool)
+    }
+  }
+}
+
+# ---------- METHOD = "time_window": how a missing value is filled (example: WINDOW_DAYS = 30, UNIT = "day") ----------
+# A missing value is filled with the MEAN (numeric column) or the most common value (categorical column) of the OBSERVED values of the same column:
+#   - day 1 (the first time unit) has no past: the first FIRST_K (10) observed values of the column are used;
+#   - day 2 up to day 30: all the observed values before this day are used (the whole past so far);
+#   - day 31 and later: only the observed values of the past 30 days are used (the 30 days right before this day);
+#   - if there is still nothing to use (for example the past 30 days are all missing): the overall mean of the raw rows is used (FALLBACK = "overall").
+# Only really observed values are used: a filled value never fills another one.
+if (METHOD == "time_window") {
+  for (col in c(NUM, CAT)) {
+    x       <- df[[col]]
+    x_raw   <- x[raw_rows]
+    first_k <- head(x_raw[!is.na(x_raw)], FIRST_K)                                  # the first FIRST_K observed values of the raw rows
+    for (i in which(is.na(x))) {
+      if (tm[i] == 0) {                                                             # the first time unit: there is no past
+        pool <- first_k
+      } else if (tm[i] < WINDOW_DAYS) {                                             # time unit 2 up to WINDOW_DAYS: all the observed values before this row's time
+        pool <- x[tm < tm[i]]
+      } else {                                                                      # after that: only the observed values of the past WINDOW_DAYS time units
+        pool <- x[tm < tm[i] & tm >= tm[i] - WINDOW_DAYS]
+      }
+      pool <- pool[!is.na(pool)]                                                    # only observed values
+      if (length(pool) == 0 && FALLBACK == "overall") pool <- overall_of(x)         # still nothing: the overall value of raw
+      if (length(pool) > 0 &&  is.numeric(x)) df_mean[[col]][i] <- mean(pool)                  # <-- mean
+      if (length(pool) > 0 && !is.numeric(x)) df_mean[[col]][i] <- most_common(pool)
+    }
+  }
+}
+
+# ---------- METHOD = "last_k": the last K observed values before this row ----------
+if (METHOD == "last_k") {
+  for (col in c(NUM, CAT)) {
+    x <- df[[col]]
+    for (i in which(is.na(x))) {
+      past <- x[seq_len(i - 1)]                      # all rows before this row (rows are sorted by time), 1:(i-1)
+      past <- past[!is.na(past)]                     # only observed values
+      pool <- tail(past, K)                          # the last K of them
+      if (length(pool) == 0 && FALLBACK == "overall") pool <- overall_of(x)   # nothing to use: the overall value of raw
+      if (length(pool) > 0 &&  is.numeric(x)) df_mean[[col]][i] <- mean(pool)                  # <-- mean
+      if (length(pool) > 0 && !is.numeric(x)) df_mean[[col]][i] <- most_common(pool)
+    }
+  }
+}
+
+# ---------- METHOD = "same_time": the other rows with the same time ----------
+if (METHOD == "same_time") {
+  for (col in c(NUM, CAT)) {
+    x <- df[[col]]
+    for (i in which(is.na(x))) {
+      pool <- x[tm == tm[i] & seq_along(x) != i]     # the other rows with the same time
+      pool <- pool[!is.na(pool)]
+      if (length(pool) == 0 && FALLBACK == "overall") pool <- overall_of(x)   # nothing to use: the overall value of raw
+      if (length(pool) > 0 &&  is.numeric(x)) df_mean[[col]][i] <- mean(pool)                  # <-- mean
+      if (length(pool) > 0 && !is.numeric(x)) df_mean[[col]][i] <- most_common(pool)
+    }
+  }
+}
+
+# How many values were missing before, and how many are still missing (only possible with FALLBACK = "none")
+data.frame(missing_before = colSums(is.na(df[c(NUM, CAT)])),
+           still_missing  = colSums(is.na(df_mean[c(NUM, CAT)])))
+
+full <- df_mean                                     # ALL the rows, filled with the same method
+```
+
+### 11-2. (Optional) Make new columns
+
+Copy the lines you need and edit the names. The new columns are made on `full`, so `raw` and `holdout` both get them. They are made **after** the fill, from filled columns.
+
+- Use only rules that look at **one row**, or numbers **you write** (a cut-off of 15 degrees). A number learned from the data (a mean, a median, a quantile) would also use the holdout.
+- **Never use the target (`TARGET`) to make a predictor.**
+- The last lines of the chunk write the new names in `NUM` / `CAT`: **edit `new_num` and `new_cat`** (only the columns you kept).
+
+```{r new-columns}
+WEEK_ORDER <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+# --- a number from a date: how many days the station has been open on that day
+full$station_age_days <- as.numeric(full$date - full$opened_date)
+
+# --- parts of a date (categories)
+full$weekday <- factor(WEEK_ORDER[as.numeric(format(full$date, "%u"))], levels = WEEK_ORDER)     # Monday ... Sunday
+full$month   <- factor(format(full$date, "%m"))                                                   # "03" ... "09"   (as a number instead: as.numeric(format(full$date, "%m")))
+
+# --- two columns together
+full$feels_diff <- full$feels_like_c - full$temp_c                    # a difference
+full$wind_rain  <- full$wind_kmh * full$rain_mm                       # a product
+
+# --- one column changed
+full$temp_c2  <- full$temp_c^2                                         # squared
+full$log_rain <- log(full$rain_mm + 1)                                 # log (+ 1 because rain_mm can be 0)
+
+# --- a rule that you write (the cut-offs are YOUR numbers, not learned from the data)
+full$is_rainy  <- as.integer(full$rain_mm > 0)                                                                    # 0 / 1
+full$temp_band <- cut(full$temp_c, breaks = c(-Inf, 5, 15, 25, Inf), labels = c("cold", "cool", "warm", "hot"))   # a category
+
+# --- two categories together
+full$type_charging <- paste(full$station_type, full$has_charging, sep = "_")
+
+# ===== Tell the template about the new columns (EDIT: only the columns you kept) =====
+new_num <- character(0)      # the numeric columns you made, for example c("station_age_days", "temp_c2")
+new_cat <- character(0)      # the category columns you made, for example c("weekday", "temp_band")
+
+NUM <- unique(c(NUM, new_num))        # for the analysis template (saved in 11-4)
+CAT <- unique(c(CAT, new_cat))
+
+sapply(full[c(new_num, new_cat)], function(x) class(x)[1])
+sapply(full[c(new_num, new_cat)], function(x) sum(is.na(x)))     # missing values of the new columns
+```
+
+### 11-3. (Optional) Time-series features of the target
+
+**Optional: lagged features are for later**, if the models do not work well enough without them. Only if the data has a time column and the target is a number that follows the time (a series). Set `TS_MODE` in the settings: `"none"` (the default), `"row"` or `"bar"`. Every feature uses **only the past** of the row (the previous rows or bars), and it is made on `full`, so the first holdout rows have their history. The first `LONG` rows (bars) have no full history: they are dropped.
+
+- `"row"`: from the previous **rows** (lags 1-3, mean and sd of the previous 5 and 20 rows). For data with ONE row per time point (a price series). With several rows per day (the stations of the bike data) the previous row is another station: do not use it there.
+- `"bar"`: from the previous **days / hours**: one value per bar (the mean of the target over the rows of the bar), then lags and rolling mean / sd of those values. Use it when there are several rows per day. In the chunk keep ONE of the three lines that define the bars (hour / day / week).
+- The names (`ret_lag1` ... `sharpe_short`) come from finance: read `ret` as "the target". The new columns are added to `NUM`.
+
+#### Based on rows (`TS_MODE <- "row"`)
+
+```{r time-series-features}
+if (TS_MODE == "row") {
+  # ===== Time-series feature engineering =====  
+  SHORT <- 5
+  LONG  <- 20
+
+  y <- full[[TARGET]]
+  n <- nrow(full)
+
+  # 1. Lag features
+  full$ret_lag1 <- dplyr::lag(y, 1)
+  full$ret_lag2 <- dplyr::lag(y, 2)
+  full$ret_lag3 <- dplyr::lag(y, 3)
+
+  # Absolute size of the previous observation
+  full$ret_abs_lag1 <- abs(full$ret_lag1)
+
+  # 2. Rolling mean and standard deviation of past values
+  ret_mean_short <- rep(NA_real_, n)
+  ret_sd_short   <- rep(NA_real_, n)
+  ret_sd_long    <- rep(NA_real_, n)
+
+  for (i in (SHORT + 1):n) {
+    past <- y[(i - SHORT):(i - 1)]
+    ret_mean_short[i] <- mean(past)
+    ret_sd_short[i]   <- sd(past)
+  }
+
+  for (i in (LONG + 1):n) {
+    ret_sd_long[i] <- sd(y[(i - LONG):(i - 1)])
+  }
+
+  full$ret_mean_short <- ret_mean_short
+  full$ret_sd_short   <- ret_sd_short
+  full$ret_sd_long    <- ret_sd_long
+
+  # 3. Sharpe-like ratio
+  full$sharpe_short <- ifelse(
+    full$ret_sd_short > 0,
+    full$ret_mean_short / full$ret_sd_short,
+    NA_real_
+  )
+
+  # 4. Drop initial rows without a full history
+  new_cols <- c(
+    "ret_lag1", "ret_lag2", "ret_lag3", "ret_abs_lag1",
+    "ret_mean_short", "ret_sd_short", "ret_sd_long",
+    "sharpe_short"
+  )
+
+  cat("Rows before:", nrow(full), "| Dropped:", LONG, "\n")
+
+  full <- full[seq_len(n) > LONG, ]
+
+  # Add new features to numeric predictors (unique(): running the chunk again does not add the names twice)
+  NUM <- unique(c(NUM, new_cols))        # the new columns become numeric predictors (unique(): no repeated names)
+
+  # Check remaining missing values
+  colSums(is.na(full[new_cols]))
+}
+```
+
+#### Based on a unit of time, day or hour (`TS_MODE <- "bar"`)
+
+```{r time-series-bars}
+if (TS_MODE == "bar") {
+  # ===== Time-series features by TIME BAR (hour / day / week): every feature uses ONLY the previous bars =====
+  SHORT <- 5            # the short window: the previous 5 bars
+  LONG  <- 20           # the long window: the previous 20 bars
+
+  # Which bar (week / day / hour) does every row belong to? Keep ONE of the three lines.
+  tm <- floor(as.numeric(difftime(full[[TIME]], lubridate::floor_date(min(full[[TIME]]), "hour"), units = "hours")))     # hour bars
+  # tm <- floor(as.numeric(difftime(full[[TIME]], lubridate::floor_date(min(full[[TIME]]), "day"), units = "days")))     # day bars
+  # tm <- floor(as.numeric(difftime(full[[TIME]], lubridate::floor_date(min(full[[TIME]]), "week", week_start = 1), units = "weeks")))   # week bars
+
+  # Renumber the bars: only the bars that HAVE rows count. Weekends, holidays and nights without data are skipped,
+  # so "the previous bar" is the previous bar WITH data (Monday -> Friday if there is no weekend data, Monday -> Sunday if there is).
+  tm <- match(tm, sort(unique(tm))) - 1
+
+  y <- full[[TARGET]]     # the series (for returns: the return column)
+
+  # 1) One value per bar: the mean of the series inside the bar (use sum(...) instead of mean(...) if the values add up)
+  nb <- max(tm) + 1                                        # number of bars (bar numbers start at 0, R positions at 1)
+  bar_value <- rep(NA_real_, nb)
+  bar_mean  <- tapply(y, tm, mean)                         # mean of every bar (names = bar numbers)
+  bar_value[as.numeric(names(bar_mean)) + 1] <- bar_mean   # +1: bar number 0 is position 1
+
+  # 2) Features of every bar, from the PREVIOUS bars only (the bar itself is NOT included)
+  f_lag1 <- dplyr::lag(bar_value, 1)                       # the previous bar
+  f_lag2 <- dplyr::lag(bar_value, 2)
+  f_lag3 <- dplyr::lag(bar_value, 3)
+  f_mean_short <- rep(NA_real_, nb)
+  f_sd_short   <- rep(NA_real_, nb)
+  f_sd_long    <- rep(NA_real_, nb)
+  for (b in (SHORT + 1):nb) {
+    past <- bar_value[(b - SHORT):(b - 1)]                 # the previous SHORT bars
+    past <- past[!is.na(past)]
+    if (length(past) >= 1) f_mean_short[b] <- mean(past)
+    if (length(past) >= 2) f_sd_short[b]   <- sd(past)
+  }
+  for (b in (LONG + 1):nb) {
+    past <- bar_value[(b - LONG):(b - 1)]
+    past <- past[!is.na(past)]
+    if (length(past) >= 2) f_sd_long[b] <- sd(past)
+  }
+
+  # 3) Give every ROW the features of its bar
+  pos <- tm + 1                                            # the position of the row's bar
+  full$ret_lag1       <- f_lag1[pos]
+  full$ret_lag2       <- f_lag2[pos]
+  full$ret_lag3       <- f_lag3[pos]
+  full$ret_mean_short <- f_mean_short[pos]
+  full$ret_sd_short   <- f_sd_short[pos]
+  full$ret_sd_long    <- f_sd_long[pos]
+  full$sharpe_short   <- ifelse(full$ret_sd_short > 0, full$ret_mean_short / full$ret_sd_short, NA)
+
+  # 4) Drop the rows of the first LONG bars (no full history)
+  new_cols <- c("ret_lag1", "ret_lag2", "ret_lag3", "ret_mean_short", "ret_sd_short", "ret_sd_long", "sharpe_short")
+  cat("rows before:", nrow(full), "| dropped (first", LONG, "bars):", sum(tm < LONG), "\n")
+  full <- full[tm >= LONG, ]
+  NUM <- unique(c(NUM, new_cols))        # the new columns become numeric predictors (unique(): no repeated names)
+  colSums(is.na(full[new_cols]))        
+}
+```
+
+### 11-4. Cut `raw` and `holdout` out of `full` and save them
+
+```{r save-raw-holdout}
+raw     <- full[full$.part == "raw",     names(full) != ".part"]
+holdout <- full[full$.part == "holdout", names(full) != ".part"]
+full    <- full[names(full) != ".part"]                    # full = raw followed by holdout, without the label
+df      <- raw                                             # the working copy of the EDA: the same as raw
+
+saveRDS(raw,     "raw.rds")                                # the analysis template reads these three files
+saveRDS(holdout, "holdout.rds")
+saveRDS(list(NUM = NUM, CAT = CAT), "roles.rds")           # which columns are numeric / categorical predictors
+
+cat("saved: raw", nrow(raw), "rows | holdout", nrow(holdout), "rows | numeric predictors", length(NUM), "| categorical predictors", length(CAT), "\n")
+cat("missing values left in the predictors: raw", sum(is.na(raw[c(NUM, CAT)])), "| holdout", sum(is.na(holdout[c(NUM, CAT)])), "\n")
+```
+
+## Appendix: basic operations (the original "section 0" reference)
+
+Every chunk below is independent of your data: it uses a tiny table `ex`. Operations that change something are done on a copy (`temp <- ex`), and in R **a copy never changes the original**.
+
+```{r appendix-example}
+ex <- data.frame(customer_id = c(1, 2, 3), age = c(25, 40, 31), gender = c("F", "M", "F"))
+ex
+```
+
+### Vector (a pandas Series: one column of values)
+
+```{r appendix-vector}
+# ===== Add to a vector =====
+s <- c(25, 40, 31)
+s <- c(s, 50)                       # add at the end
+s <- c(10, s)                       # add at the front
+s <- append(s, 99, after = 2)       # add after the 2nd element
+s
+
+# ===== Remove from a vector =====
+s <- c(25, 40, 31, 40, 50)
+s[-1]                               # remove the 1st element (by position)
+s[-c(1, 3)]                         # remove the 1st and the 3rd
+s[s != 40]                          # remove every element equal to 40 (by value)
+s[!(s %in% c(40, 50))]              # remove several values at once
+setdiff(s, 40)                      # remove a value and the repeated values (the result has no repeats)
+# DANGER: s[-which(s == 99)] returns NOTHING when no element equals 99. Use the lines above instead.
+
+# ===== The same with names (the list of variables) =====
+cols <- c("n_items", "n_units", "age", "tenure_days", "gender")
+cols <- c(cols, "ret_lag1")                  # add a variable
+cols <- unique(c(cols, "ret_lag1"))          # add it again: unique() keeps it only once
+cols <- setdiff(cols, "age")                 # remove a variable
+cols <- cols[!cols %in% c("n_units", "gender")]     # remove several variables
+cols
+"age" %in% cols                      # is it in the vector?  TRUE / FALSE
+which(cols == "tenure_days")         # at which position?
+length(cols)                         # how many?
+
+# ===== Named vector: remove or change by name =====
+s <- c(a = 25, b = 40, c = 31)
+s[names(s) != "b"]                   # remove the element named b
+s[!names(s) %in% c("a", "c")]        # remove several by name
+s["b"] <- 41                         # change one value
+s["d"] <- 60                         # add a new named element
+s
+
+# ===== Change, sort, repeat =====
+s <- c(25, 40, 31, 40)
+s[2] <- 0                            # change the 2nd element
+sort(s); sort(s, decreasing = TRUE)  # sort
+rev(s)                               # reverse the order
+unique(s)                            # remove the repeated values
+duplicated(s)                        # TRUE for the repeated ones
+head(s, 2); tail(s, 2)               # the first 2 / the last 2                              # the names
+```
+
+### Data frame (a pandas DataFrame: several columns)
+
+```{r appendix-dataframe}
+d1 <- data.frame(age = c(25, 40, 31), gender = c("F", "M", "F"))    # {column = values}
+d2 <- tibble(age = c(25, 40, 31), gender = c("F", "M", "F"))        # tibble: a data frame that prints nicely
+d3 <- tribble(~age, ~gender,                                        # row by row
+              25, "F",
+              40, "M")
+d4 <- bind_rows(list(age = 25, gender = "F"), list(age = 40, gender = "M"))   # a list of rows
+d1; d2; d3; d4
+# d5 <- read_csv("file.csv")                                         # from a file (see section 1)
+
+# Taking ONE column out of a table
+ex$age                      # a vector (like a Series)
+ex[["age"]]                 # the same
+pull(ex, age)               # the same
+ex["age"]                   # still a table with one column
+select(ex, age)             # still a table with one column
+```
+
+### Select columns
+
+```{r appendix-select}
+select(ex, age, gender)                        # by name
+ex[c("age", "gender")]                         # same, base R
+temp <- select(ex, age, gender)                # keep the result in a new table
+select(ex, -gender)                            # everything except gender
+select(ex, 1, 3)                               # by position: 1st and 3rd column
+select(ex, where(is.numeric))                  # by type: numeric columns
+select(ex, where(is.character))                # text columns   (also is.factor, is.logical)
+# select(df, where(is.Date))                   # date columns: needs library(lubridate)
+select(ex, contains("age"))                    # name contains "age"
+select(ex, starts_with("cust"))                # name starts with "cust"   (also ends_with)
+
+cols <- setdiff(names(ex), c("customer_id"))   # a list of names: all columns except customer_id
+ex[cols]                                       # select with that list
+select(ex, all_of(cols))                       # same
+names(ex)[str_starts(names(ex), "a")]          # column names that start with "a"
+```
+
+### Rename columns
+
+```{r appendix-rename}
+rename(ex, customer_age = age, sex = gender)   # rename(NEW = OLD)  <- the new name comes first
+
+temp <- ex
+names(temp) <- c("a", "b", "c")                # replace all names (same number, same order)
+temp
+
+rename_with(ex, toupper)                       # apply a function to every name, to upper case
+rename_with(ex, ~ str_replace_all(str_to_lower(str_trim(.x)), " ", "_"))   # rule: trim spaces, lower case, " " -> "_"
+rename_with(ex, ~ paste0("c_", .x))            # add a prefix to every column
+rename_with(ex, ~ paste0(.x, "_raw"))          # add a suffix to every column
+```
+
+### Change the column order
+
+```{r appendix-reorder}
+select(ex, gender, age)                        # list them in the new order (only the listed columns are kept)
+relocate(ex, gender)                           # move gender to the front, keep the others
+relocate(ex, gender, .after = age)             # put gender right after age
+select(ex, gender, everything())               # gender first, then all the others
+```
+
+### Add and delete columns
+
+```{r appendix-add-delete}
+temp <- ex
+temp$age2  <- temp$age * 2                          # a new column from a calculation
+temp$flag  <- 0                                     # the same value in every row
+temp$group <- ifelse(temp$age >= 30, "old", "young")   # value by condition (like np.where)
+temp
+temp <- mutate(temp, age3 = age * 3)                # the same with mutate
+temp <- select(temp, -age2, -flag)                  # delete columns
+temp$age3 <- NULL                                   # delete one column
+group_col <- temp$group                             # take a column out ...
+temp$group <- NULL                                  # ... and delete it (like pandas pop)
+temp
+```
+
+### Change column types
+
+```{r appendix-types}
+temp <- ex
+temp$age    <- as.numeric(temp$age)                 # also as.integer, as.character
+temp$gender <- as.factor(temp$gender)               # category
+temp$d <- c("2024-01-05", "2024-02-10", "bad")
+temp$d <- as.Date(temp$d, format = "%Y-%m-%d")      # text -> date; "bad" becomes NA  or temp$d[temp$d == "bad"] <- NA
+temp
+sapply(temp, class)
+```
+
+### Select rows
+
+```{r appendix-rows}
+ex[ex$age > 30, ]                              # by condition (base R)
+filter(ex, age > 30)                           # by condition (dplyr; rows with NA in the condition are dropped)
+ex[ex$age > 30, c("age", "gender")]            # condition + columns
+filter(ex, age > 30) %>% select(age, gender)   # same
+head(ex, 2)                                    # first 2 rows
+ex[1:2, 1:2]                                   # by position
+slice(ex, 1:2)                                 # same
+slice_sample(ex, n = 2)                        # 2 random rows (run set.seed(0) first to get the same rows every time)
+slice(ex, 2:n())                               # from the 2nd row to the end
+```
+
+### Delete rows
+
+```{r appendix-delete-rows}
+ex[-c(1, 3), ]                                 # delete rows 1 and 3 by position
+slice(ex, -c(1, 3))                            # same
+filter(ex, !(age > 120))                       # delete rows by condition (= keep the others)
+ex[ex$age <= 120, ]                            # same, base R
+# DANGER: ex[-which(ex$age > 120), ] returns ZERO rows when no row matches. Use the lines above instead.
+```
+
+### Row names ("index")
+
+```{r appendix-index}
+# A tibble has no index: keep the ID as an ordinary column. For a plain data.frame you can use row names:
+temp <- as.data.frame(ex)
+temp <- column_to_rownames(temp, "customer_id")      # column -> row names     (pandas set_index)
+temp
+temp <- rownames_to_column(temp, "customer_id")      # row names -> column     (pandas reset_index)
+temp
+```
+
+### Flip row and column
+
+```{r flip}
+temp <- as.data.frame(t(temp))
+temp
+```
+
+### Select text by pattern
+
+```{r appendix-strings}
+x <- c("Mouse", "Laptop", "Keyboard", "Monitor", "Headphones")
+str_starts(x, "M")               # starts with M
+str_ends(x, "er")                # ends with "er"
+str_detect(x, "ou")              # contains "ou" anywhere
+str_detect(x, "^(M|L)")          # starts with M or L
+x[str_starts(x, "M")]            # the matching values themselves
+```
+
+## Date and time
+
+```{r date-time}
+library(tidyverse)
+library(lubridate)
+
+d <- as.Date("2024-03-05")                          # date (Tuesday)
+x <- as.POSIXct("2024-03-05 14:07:09", tz = "UTC")  # date + time
+
+# ===== Current date and time =====
+Sys.Date()       # current date
+Sys.time()       # current date and time
+
+# ===== Date/time -> text =====
+format(x, "%Y")       # year: "2024"     %y : "24"
+format(x, "%m")       # month: "03"
+format(x, "%d")       # day: "05"
+format(x, "%H")       # hour: "14"
+format(x, "%M")       # minute: "07"
+format(x, "%S")       # second: "09"
+format(x, "%u")       # weekday: Monday = 1, Sunday = 7
+format(x, "%w")       # weekday: Sunday = 0, Saturday = 6
+format(x, "%Y-%m")    # year-month: "2024-03"
+weekdays(d)           # weekday name: "Tuesday"
+months(d)             # month name: "March"
+
+# ===== Text -> date or date-time =====
+as.Date("2024-03-05")
+as.Date("05/03/2024", format = "%d/%m/%Y")
+
+as.POSIXct("2024-03-05 14:07:09",
+           format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+
+# Parse dates with lubridate
+ymd("2024-03-05")
+mdy("03/05/2024")
+dmy("05/03/2024")
+ymd_hms("2024-03-05 14:07:09")
+
+# ===== Extract date components =====
+year(d)
+month(d)
+day(d)
+wday(d, label = TRUE, week_start = 1)
+yday(d)       # day of the year
+week(d)
+quarter(d)
+
+# ===== Date arithmetic =====
+d - 30                                  # 30 days before
+as.Date("2024-04-01") - d               # days between dates
+x - 7                                   # 7 seconds before
+x - days(7)                             # 7 days before
+difftime(x, as.POSIXct("2024-03-05 08:00:00", tz = "UTC"),
+         units = "hours")               # hours between dates
+d %m-% months(1)                        # 1 month before
+
+# ===== Round down or up to a period =====
+floor_date(d, "week", week_start = 1)   # Monday of that week
+floor_date(x, "day")                    # start of the day
+floor_date(x, "hour")                   # start of the hour
+floor_date(d, "month")                  # first day of the month
+ceiling_date(d, "month")                # start of the next month
+
+# ===== Create date sequences =====
+seq(as.Date("2024-03-01"), as.Date("2024-03-05"), by = "day")
+seq(as.Date("2024-01-01"), as.Date("2024-12-01"), by = "month")
+
+# ===== Date-time -> date =====
+as.Date(x)                              # remove time of day
+```

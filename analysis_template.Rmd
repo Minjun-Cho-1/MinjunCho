@@ -1,0 +1,1539 @@
+---
+title: "Data Analysis Template (R, beginner version)"
+output: html_document
+---
+
+```{r knitr-setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 7, fig.height = 4.5, dpi = 110)
+```
+
+# Data Analysis Template (R, beginner version)
+
+**Contents** (the big sections)
+
+0. Packages and settings
+1. Load `raw`
+2. Prepare `dat`
+3. Variable selection (forward / backward, AIC / BIC)
+4. Check the assumptions of the selected lm
+5. Transformations: Box-Cox for y, and a light try for the x
+6. Outliers (the rows the lm misses, and how they differ from the others)
+7. Interactions
+8. The models, fitted on all of `raw`, and their plots
+9. Model comparison: moving window (train = the last 60 days)
+10. The holdout (once)
+
+**Part B. Classification** (the TARGET is a category): sections B-0 ... B-10, at the end of this file.
+
+- **This file has two parts: Part A (the TARGET is a number) and Part B (the TARGET is a category, at the end).** Run Part A **or** Part B, not both: they use the same names (`TARGET`, `raw`, `dat` ...). Part B has its own settings and starts from the same files of the EDA template.
+- This template reads the files written by the EDA template (`raw.rds`, `roles.rds`, and at the very end `holdout.rds`).
+- **You decide the analysis.** The template runs the steps and shows the numbers; the places where **you decide** are marked `# <-- YOUR DECISION`:
+  `SELECTED` (section 3), `X_TRANS` (section 5), `R_LIMIT` (section 6), `COLUMN1` / `COLUMN2` / `INTER_ADD` (section 7), `FINAL` (section 9), `BEST` (section 10).
+- The order of the steps: variable selection with lm -> check the lm -> transform y once with Box-Cox (and maybe a few x) -> look at the outliers (the rows the lm misses) -> interactions -> fit the models -> compare them with a moving window -> the holdout. **Box-Cox is done once and never again.**
+- **Time series is the default:** the models are always trained on the **last `WINDOW` days** before the days they predict (default 60), and moved forward by `TEST_DAYS` days (default 7). Without a time column (`TIME <- NULL`) K-fold is used instead.
+
+**What to change for a new data set (and where it is)**
+
+| what | where |
+|---|---|
+| `TARGET`, `TIME` (`NULL` = no time column), `GROUP` (`NULL` = none) | chunk `settings` (section 0): the three required settings |
+| the length of the moving window, the number of days predicted at once, the family of the glm | `settings`: `WINDOW`, `TEST_DAYS`, `GLM_FAMILY` |
+| the numeric / categorical predictors | the EDA template wrote them to `roles.rds`. To use your own lists, write `NUM <- c(...)` and `CAT <- c(...)` in chunk `load-raw` |
+| y has zeros | `settings`: `Y_SHIFT <- 1` (then `log(y + 1)` is used if Box-Cox says log) |
+| which variable-selection result | section 3, chunk `select-final`: `SELECTED` |
+| which transformations of the x | section 5, chunk `x-trans`: `X_TRANS` |
+| how strict the outlier candidates are | section 6, chunk `outlier-check`: `R_LIMIT` |
+| which interactions | section 7: option 1 = chunk `inter-test` (`COLUMN1`, `COLUMN2`, then `inter-add`), option 2 = chunks `inter-scan` and `inter-scan-add` (`INTER_ADD`). Both fill `INTER_SEL` |
+| which model to read the coefficients of / to look at in the holdout plots | section 9-1, chunk `final-model`: `FINAL` / section 10, chunk `holdout-plot`: `BEST` |
+
+### Notation (the same in the EDA template)
+
+| name | meaning |
+|---|---|
+| `raw` | the rows we explore, select variables on, and compare the models on |
+| `holdout` | the last rows (days), opened **once** at the end (section 10) |
+| `dat` | `raw` ready for the models, as factors (section 2): used in sections 3-8 |
+| `full` | `raw` followed by `holdout` (section 10) |
+| `NUM`, `CAT` | the numeric and the categorical predictors |
+
+# Part A. Regression (the TARGET is a number)
+
+## 0. Packages and settings
+
+```{r settings}
+# install.packages(c("tidyverse", "glmnet", "lme4", "MASS", "car"))     # run once if a package is missing
+library(tidyverse)
+options(width = 150)
+
+# ===== Settings =====
+SEED       <- 0
+TARGET     <- "rentals"            # the numeric outcome (y)
+TIME       <- "date"               # the time column. NULL if the data has no time column
+GROUP      <- "station_id"         # a column whose values repeat (the same station / customer ...). NULL if none
+
+WINDOW     <- 60                   # moving window: the models are trained on the last 60 days before the days they predict
+TEST_DAYS  <- 7                    # ... and predict the next 7 days, then the window moves forward by 7 days
+FOLDS      <- 5                    # K-fold (only used when there is no time column)
+
+GLM_FAMILY <- Gamma(link = "log")  # glm / glmm for a positive outcome that is skewed. Counts: poisson(link = "log").  Other: gaussian()
+Y_SHIFT    <- 0                    # if y has zeros: 1  (Box-Cox needs y > 0; then log(y + 1) is used)
+# ====================
+
+HAS_TIME <- !is.null(TIME)
+set.seed(SEED)
+```
+
+## 1. Load `raw`
+
+```{r load-raw}
+raw   <- readRDS("raw.rds")         # written by the EDA template (section 11-4)
+roles <- readRDS("roles.rds")
+NUM   <- roles$NUM                  # numeric predictors   (your own list: NUM <- c("temp_c", "rain_mm"))
+CAT   <- roles$CAT                  # categorical predictors (your own list: CAT <- c("station_type"))
+
+if (HAS_TIME) {
+  raw <- raw[order(raw[[TIME]]), ]
+  raw$.day <- as.Date(raw[[TIME]])  # the day of every row (the moving window works with days)
+}
+stopifnot(all(c(TARGET, NUM, CAT, GROUP) %in% names(raw)))
+
+cat("raw:", nrow(raw), "rows | numeric predictors:", length(NUM), "| categorical predictors:", length(CAT), "\n")
+NUM
+CAT
+```
+
+## 2. Prepare `dat`
+
+There is **nothing to decide here: just run the chunk.** It makes two things:
+
+- `dat`: `raw` with the categorical columns turned into factors (the form the models need). The missing values of the predictors were already filled in the EDA template (its section 11), so there is normally nothing left to fill. Sections 3-8 use `dat`.
+- `fill_missing(train, test)`: used again inside every model of sections 8-10, just before the model is fitted. It makes the categories the same in train and test (a category that is not in train becomes the filler). It is also a **safety net**: a predictor value that is still missing is filled with the **mean of the training rows** (a categorical column: the new category `"Missing"`, or the most frequent category if there was no missing value in the training rows).
+
+The outcome (`TARGET`) is never filled.
+
+```{r fill-missing}
+most_common <- function(x) names(sort(table(x), decreasing = TRUE))[1]
+
+fill_missing <- function(train, test) {
+  for (col in NUM) {
+    m <- mean(train[[col]], na.rm = TRUE)                 # the mean of the TRAIN rows
+    train[[col]][is.na(train[[col]])] <- m
+    test[[col]][is.na(test[[col]])]   <- m
+  }
+  for (col in CAT) {
+    train[[col]] <- as.character(train[[col]])
+    test[[col]]  <- as.character(test[[col]])
+    fill <- if (any(is.na(train[[col]]))) "Missing" else most_common(train[[col]])
+    train[[col]][is.na(train[[col]])] <- fill
+    test[[col]][is.na(test[[col]]) | !(test[[col]] %in% train[[col]])] <- fill    # NA, or a category that is not in train
+    train[[col]] <- factor(train[[col]])
+    test[[col]]  <- factor(test[[col]], levels = levels(train[[col]]))             # the same levels in train and test
+  }
+  list(train = train, test = test)
+}
+
+dat <- fill_missing(raw, raw)$train                       # raw with factors (and anything that is still missing filled)
+
+# check: nothing should be missing in the predictors (0 = the EDA template did its job)
+cat("missing values in the predictors: raw", sum(is.na(raw[c(NUM, CAT)])), "| dat", sum(is.na(dat[c(NUM, CAT)])), "\n")
+```
+
+## 3. Variable selection (forward / backward, AIC / BIC)
+
+Four ways to select the variables of an lm:
+
+- **forward**: start from no variable and add the variable that helps most, until nothing helps;
+- **backward**: start from all variables and remove the one that hurts least, until every one is needed;
+- **AIC** keeps more variables, **BIC** keeps fewer (a bigger penalty for every variable).
+
+**The scores that compare the models.** k = number of parameters, p = number of predictors, n = number of rows, L = the maximized likelihood, R^2 = 1 - RSS / TSS.
+
+| score | formula | better | pros | cons |
+|---|---|---|---|---|
+| **AIC** | `AIC = 2k - 2 ln(L)` | smaller | Light penalty: keeps more variables, good for prediction. Likelihood-based, so it also works for glm and logistic regression | Can keep noise variables (overfit); a bigger model is harder to explain |
+| **BIC** | `BIC = k ln(n) - 2 ln(L)` | smaller | Heavier penalty (it grows with n, and it is bigger than the one of AIC when n >= 8): a simpler model that is easy to explain. With a lot of data it finds the true model (if it is among the candidates) | May drop weak but useful variables (underfit), which can cost prediction accuracy |
+| **adjusted R^2** | `adj R^2 = 1 - (1 - R^2) (n - 1) / (n - p - 1)` | larger | Easy to read: the share of the variance that is explained, corrected for the number of variables. It needs no normal errors: only the residual sum of squares and the degrees of freedom | The lightest penalty (a variable stays if its F-statistic is larger than 1, for one variable: its t-statistic larger than 1 in absolute value): keeps the most variables. Only for lm, not for glm or logistic regression. Not likelihood-based |
+
+If the variables were selected by each score, the number that is kept would usually be: adjusted R^2 >= AIC >= BIC.
+
+**Our goal is prediction, so AIC is the default** (`SELECTED <- "forward_AIC"` below). BIC gives the simpler alternative, and adjusted R^2 is only a reference column of the table (`step()` does not select with it). The final choice among the models is made later, with the cross-validated RMSE (section 9).
+
+```{r select-four}
+m_null <- lm(reformulate("1", TARGET), data = dat)
+m_full <- lm(reformulate(c(NUM, CAT), TARGET), data = dat)
+n      <- nrow(dat)
+
+sel <- list(
+  forward_AIC  = step(m_null, scope = formula(m_full), direction = "forward",  trace = 0),
+  forward_BIC  = step(m_null, scope = formula(m_full), direction = "forward",  trace = 0, k = log(n)),
+  backward_AIC = step(m_full, direction = "backward", trace = 0),
+  backward_BIC = step(m_full, direction = "backward", trace = 0, k = log(n)))
+sel$full <- m_full
+
+# the four results and the full model side by side
+data.frame(n_terms = sapply(sel, function(m) length(attr(terms(m), "term.labels"))),
+           AIC     = round(sapply(sel, AIC), 1),
+           BIC     = round(sapply(sel, BIC), 1),
+           adj_R2  = round(sapply(sel, function(m) summary(m)$adj.r.squared), 4))
+
+for (nm in names(sel)) cat(nm, ":", attr(terms(sel[[nm]]), "term.labels"), "\n\n")
+```
+
+```{r select-final}
+SELECTED <- "forward_AIC"      # <-- YOUR DECISION: "forward_AIC" | "forward_BIC" | "backward_AIC" | "backward_BIC" | "full"
+
+formula_sel <- formula(sel[[SELECTED]])                  # the selected formula: everything below is built on it
+sel_terms   <- attr(terms(formula_sel), "term.labels")   # its terms
+formula_sel
+```
+
+## 4. Check the assumptions of the selected lm
+
+```{r assumptions}
+ols <- lm(formula_sel, data = dat)
+
+# The 4 basic plots of an lm:
+# 1 Residuals vs Fitted   : the points should scatter evenly around 0 (a curve = the shape is wrong; a funnel = the spread grows)
+# 2 Normal Q-Q            : the points should lie on the line (normality is not important for prediction; far-off points at the ends = outliers)
+# 3 Scale-Location        : the red line should be flat (the spread is constant)
+# 4 Residuals vs Leverage : a point outside the dashed Cook's distance lines pulls the fit by itself (section 6 lists such rows)
+par(mfrow = c(2, 2))
+plot(ols)
+par(mfrow = c(1, 1))
+
+if (HAS_TIME) {                                                               # the residuals should not drift or wave over time
+  plot(dat$.day, resid(ols), main = "Residuals over time", xlab = "day", ylab = "residual")
+  abline(h = 0, col = "red")
+}
+
+# Variance inflation factor: larger than 5-10 = the variable is explained by the other variables
+tryCatch(car::vif(ols), error = function(e) "VIF cannot be computed: some columns are explained by the others (aliased). Look for two variables with the same information.")
+```
+
+## 5. Transformations
+
+### 5-1. Box-Cox: transform y (once)
+
+Box-Cox looks for the power `lambda` that makes the residuals of the lm most normal. The plot shows the best `lambda` and its 95% interval. **The rule here: `LAM` = the nearest integer of `lambda hat`.**
+
+| `LAM` | the transformed y | |
+|---|---|---|
+| 2 | `y^2` | |
+| 1 | `y` | no transformation |
+| 0 | `log(y)` | (or `log(y + 1)` when y has zeros: `Y_SHIFT <- 1`) |
+| -1 | `1/y` | |
+
+This is done **once**. After it, every model is trained on the transformed y, and the predictions are **turned back** (`from_t()`) before any error is computed.
+
+```{r boxcox}
+dat$.y0 <- dat[[TARGET]] + Y_SHIFT
+stopifnot("y + Y_SHIFT must be larger than 0: if y has zeros, write Y_SHIFT <- 1 in the settings" = all(dat$.y0 > 0))
+
+bc      <- MASS::boxcox(reformulate(sel_terms, ".y0"), data = dat, lambda = seq(-2, 2, 0.05))
+lam_hat <- bc$x[which.max(bc$y)]
+LAM     <- as.integer(round(lam_hat))       # <-- YOUR DECISION if you disagree: write LAM <- 1 (no transformation) or another integer
+cat("lambda hat =", round(lam_hat, 2), "-> LAM =", LAM, "\n")
+
+to_t   <- function(y) if (LAM == 0) log(y + Y_SHIFT) else if (LAM == 1) y else (y + Y_SHIFT)^LAM              # y -> the transformed y
+from_t <- function(z) if (LAM == 0) exp(z) - Y_SHIFT else if (LAM == 1) z else pmax(z, 1e-8)^(1 / LAM) - Y_SHIFT   # the transformed y -> y
+
+dat$.y <- to_t(dat[[TARGET]])
+ols_t  <- lm(reformulate(sel_terms, ".y"), data = dat)
+
+par(mfrow = c(1, 2))                         # the residuals before and after: the right one should be closer to the line
+qqnorm(resid(ols),   main = "Q-Q plot: y");                 qqline(resid(ols))
+qqnorm(resid(ols_t), main = paste("Q-Q plot: transformed y (LAM =", LAM, ")")); qqline(resid(ols_t))
+par(mfrow = c(1, 1))
+```
+
+### 5-2. A light try: transform the numeric x
+
+For every numeric variable of the selected formula: does adding `x^2`, `log(x)`, `sqrt(x)` or `exp(x)` help the lm of the transformed y? A negative `AIC_change` = better. A small `p_value` = the new term is useful.
+
+```{r x-trans}
+m_sel  <- lm(reformulate(sel_terms, ".y"), data = dat)
+num_in <- intersect(NUM, all.vars(formula_sel))             # the numeric variables of the selected formula
+
+tried <- NULL
+for (x in num_in) {
+  v <- dat[[x]]
+  if (n_distinct(v) <= 2) next                              # a 0/1 variable: nothing to transform
+  terms_try <- paste0("I(", x, "^2)")                       # x squared
+  if (min(v) > 0)  terms_try <- c(terms_try, paste0("log(", x, ")"))     # only possible for positive x
+  if (min(v) >= 0) terms_try <- c(terms_try, paste0("sqrt(", x, ")"))    # only possible for x >= 0
+  if (max(v) < 20) terms_try <- c(terms_try, paste0("exp(", x, ")"))     # (a big x makes exp(x) explode)
+  for (tt in terms_try) {
+    m2 <- lm(reformulate(c(sel_terms, tt), ".y"), data = dat)
+    tried <- rbind(tried, data.frame(term = tt, AIC_change = round(AIC(m2) - AIC(m_sel), 1), p_value = round(anova(m_sel, m2)[2, "Pr(>F)"], 4)))
+  }
+}
+if (!is.null(tried)) tried[order(tried$AIC_change), ]
+
+X_TRANS <- character(0)      # <-- YOUR DECISION: the terms you want to add, for example c("I(temp_c^2)", "log(rain_mm + 1)"). character(0) = none
+```
+
+### 5-3. Mid-check: the lm so far (summary only)
+
+A look at the model **so far**: the selected variables (section 3) + `X_TRANS` (above), fitted on the transformed y (Box-Cox, 5-1). Only the `summary()`: no plots. The outliers (section 6) and the interactions (section 7) are not in it yet. Reading an estimate: with the log (`LAM` = 0), one more unit of x multiplies y by `exp(estimate)` (about `estimate` x 100 % when it is small); with `LAM` = 1 (no transformation) y changes by `estimate`; with another `LAM` it is the change of the transformed y (`y^LAM`). A categorical column: the difference to its first category.
+
+```{r mid-check}
+m_mid <- lm(reformulate(c(sel_terms, X_TRANS), ".y"), data = dat)     # the selected variables + X_TRANS, on the transformed y
+summary(m_mid)
+```
+
+## 6. Outliers
+
+Outliers are looked at **only through the target**, with the lm we already have: the selected variables (section 3) + `X_TRANS` (section 5), fitted on the transformed y. A row is an **outlier candidate** if this lm misses its target by a lot:
+
+- **standardized residual** = (actual - predicted) / the typical error, on the transformed y. A row is a candidate if its absolute value is at least `R_LIMIT` (3 is the usual choice).
+- **Cook's distance** = how much one row pulls the lm by itself. It is shown as a column: a big value means the row really changes the fit.
+
+The candidates are collected in the table `out_rows` (the worst first): **look at them** (`View(out_rows)`). Then the chunk shows how they differ from the normal rows, column by column (for example: the mean of `temp_c` is 18 in the normal rows and 22 in the candidates). Nothing is removed from `dat`.
+
+```{r outlier-check}
+R_LIMIT <- 3        # <-- CHANGE HERE (optional): a row is an outlier candidate if |standardized residual| is at least this
+
+# 1. the lm (selected variables + X_TRANS, transformed y) and the numbers of every row
+m_out     <- lm(reformulate(c(sel_terms, X_TRANS), ".y"), data = dat, na.action = na.exclude)
+dat$.rstd <- rstandard(m_out)                                      # standardized residual
+dat$.cook <- cooks.distance(m_out)                                 # Cook's distance
+dat$.pred <- from_t(predict(m_out, dat))                           # the lm's prediction, back in the units of y
+dat$.out  <- (abs(dat$.rstd) >= R_LIMIT) %in% TRUE                 # TRUE = outlier candidate
+cat(sum(dat$.out), "outlier candidates in", nrow(dat), "rows (", round(100 * mean(dat$.out), 1), "%)\n")
+
+# 2. the picture: standardized residual of every row (red = candidate)
+plot(if (HAS_TIME) dat$.day else seq_len(nrow(dat)), dat$.rstd, pch = 16, cex = 0.5, col = ifelse(dat$.out, "red", "grey40"),
+     xlab = if (HAS_TIME) "day" else "row", ylab = "standardized residual", main = "Standardized residual (red = outlier candidate)")
+abline(h = c(-R_LIMIT, R_LIMIT), lty = 2)
+
+# 2b. the proportion of outlier candidates in every month (x = month). For the day instead of the month: use the `# day` line and comment out the `# month` line.
+if (HAS_TIME) {
+  period <- lubridate::floor_date(dat$.day, "month")                  # month: the first day of the month of every row
+  # period <- dat$.day                                                # day: use this line INSTEAD of the line above
+  prop   <- tapply(dat$.out, period, mean)                            # the proportion of candidates in every month (0 to 1)
+  print(ggplot(data.frame(period = as.Date(names(prop)), proportion = as.numeric(prop)), aes(x = period, y = proportion)) +
+    geom_line() + geom_point() +
+    scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m", guide = guide_axis(check.overlap = TRUE)) +
+    labs(x = "period", y = "proportion of outlier candidates", title = "Outlier candidates over time"))
+}
+
+# 3. the candidates, collected (the worst first): LOOK AT THEM
+front    <- c(TIME, GROUP, TARGET, ".pred", ".rstd", ".cook")      # the columns to read first
+out_rows <- dat[dat$.out, c(front, setdiff(c(NUM, CAT), front))]
+out_rows <- out_rows[order(-abs(out_rows$.rstd)), ]
+head(out_rows, 20)
+# View(out_rows)                                                   # (optional) in RStudio: the whole table
+```
+
+```{r outlier-compare}
+# 4. numeric columns: the mean in the normal rows and in the outlier candidates
+if (any(dat$.out) && any(!dat$.out)) {
+  cols <- c(TARGET, NUM)
+  cmp  <- data.frame(normal  = sapply(dat[!dat$.out, cols], mean, na.rm = TRUE),
+                     outlier = sapply(dat[dat$.out,  cols], mean, na.rm = TRUE))
+  cmp$diff_in_sd <- (cmp$outlier - cmp$normal) / sapply(dat[cols], sd, na.rm = TRUE)     # the difference / the overall sd: below 0.2 tiny, above 0.8 large
+  print(round(cmp[order(-abs(cmp$diff_in_sd)), ], 2))                                    # the biggest differences first
+}
+
+# 5. categories: what share of every category is an outlier candidate? (compare it with the overall share)
+if (any(dat$.out)) {
+  cat("\nthe overall share of candidates:", round(100 * mean(dat$.out), 1), "%\n")
+  share <- do.call(rbind, lapply(unique(c(CAT, GROUP)), function(v) {
+    g     <- as.character(dat[[v]]);  g[is.na(g)] <- "NA"
+    n_all <- tapply(dat$.out, g, length)
+    n_out <- tapply(dat$.out, g, sum)
+    data.frame(column = v, category = names(n_all), n = as.vector(n_all), n_outlier = as.vector(n_out),
+               pct = round(100 * as.vector(n_out) / as.vector(n_all), 1))
+  }))
+  share <- share[share$n >= 5, ]                                                         # tiny categories are left out
+  print(head(share[order(-share$pct), ], 15), row.names = FALSE)                         # the 15 categories with the highest share
+  if (HAS_TIME) print(round(100 * tapply(dat$.out, format(dat$.day, "%Y-%m"), mean), 1)) # the share in every month
+}
+```
+
+**How to read the result**
+
+- Look at `out_rows` first: are the candidates one station, one period, one kind of day? Is the actual target far above (or below) `.pred`?
+- Numeric columns: a large `diff_in_sd` means the candidates live in a different part of that column (for example hotter days). Categories: a `pct` much larger than the overall share means the candidates are concentrated there.
+- **A clear pattern** = the lm misses something that this column explains. Keep the rows and give the model that information: the variable (section 3), a transformation (section 5) or an **interaction** (next section).
+- **No pattern**: the candidates look random (a data error? a one-off event?). Check the rows by hand before you decide what to do.
+
+## 7. Interactions
+
+An interaction `a:b` means: the effect of `a` is different for different values of `b`. There are **two options**, and both fill the same list `INTER_SEL` (the interactions you keep). Use one of them, or both, as many times as you like. (Outliers that are explained by two variables together, section 6, are a good reason to test that pair.)
+
+- **OPTION 1: you choose the pair.** Write `COLUMN1` and `COLUMN2` (any two columns of `dat`, numeric or categorical), run the test, **look at the result, and decide**: run the chunk `inter-add` to add the pair, or skip it. Then go back to `COLUMN1` / `COLUMN2` and test the next pair.
+- **OPTION 2: scan.** The variables of the selected formula are tried in pairs, **one interaction at a time**, and the table shows the pairs with the smallest p-value. You write the ones you want in `INTER_ADD`.
+
+With many pairs (option 2) a few small p-values come by chance: prefer the very small ones that also make sense.
+
+```{r inter-start}
+# Run this chunk ONCE (it empties INTER_SEL): do NOT run it again after you have added interactions.
+RHS       <- c(sel_terms, X_TRANS)                                          # the terms until now
+INTER_SEL <- character(0)                                                   # the interactions kept (OPTION 1 and OPTION 2 add to it)
+RHS_FINAL <- unique(c(RHS, unlist(strsplit(INTER_SEL, ":")), INTER_SEL))    # THE FORMULA FROM NOW ON (an interaction brings the main effects of its two columns)
+```
+
+### OPTION 1: test the pair you choose
+
+The chunks of option 1 name specific columns (`temp_c`, `station_type` ...), so they are `eval = FALSE`: **they are not run when you knit**. Write your own columns and run them by hand.
+
+```{r inter-test, eval=FALSE}
+# ===== The pair to test: CHANGE HERE, then run this chunk =====
+COLUMN1 <- "temp_c"            # <-- CHANGE HERE: any column (numeric or categorical)
+COLUMN2 <- "station_type"      # <-- CHANGE HERE: another column (numeric or categorical)
+# ==============================================================
+
+stopifnot("COLUMN1 and COLUMN2 must be two different columns" = COLUMN1 != COLUMN2,
+          "COLUMN1 and COLUMN2 must be columns of dat"        = all(c(COLUMN1, COLUMN2) %in% names(dat)))
+INTER_TEST <- paste(COLUMN1, COLUMN2, sep = ":")                            # "a:b"
+same_inter <- c(INTER_TEST, paste(COLUMN2, COLUMN1, sep = ":"))             # "a:b" and "b:a" are the same interaction
+inter_keep <- setdiff(INTER_SEL, same_inter)                                # the interactions kept before (without this one: it is the one tested)
+base_terms <- unique(c(RHS, COLUMN1, COLUMN2, unlist(strsplit(inter_keep, ":")), inter_keep))   # the model WITHOUT this interaction (the main effects of both columns are in)
+
+# A column that never changes inside a group (a station's capacity ...): the interaction of TWO such columns only builds the group ID again
+if (!is.null(GROUP) && all(sapply(c(COLUMN1, COLUMN2), function(v) all(tapply(dat[[v]], dat[[GROUP]], n_distinct) == 1)))) {
+  cat("WARNING: both columns never change inside a", GROUP, ": the p-value is meaningless\n")
+}
+
+# F-test in the lm of the transformed y: a small p-value = the interaction helps
+lm0  <- lm(reformulate(base_terms, ".y"),                data = dat)
+lm1  <- lm(reformulate(c(base_terms, INTER_TEST), ".y"), data = dat)
+a_lm <- anova(lm0, lm1)
+a_lm
+cat("\n", INTER_TEST, ": p-value =", signif(a_lm[2, "Pr(>F)"], 3), "  -> add it? run the chunk inter-add (or skip it)\n")
+```
+
+#### (optional) The same pair in a glm and in a mixed model
+
+The **same** pair (`COLUMN1`, `COLUMN2`) with the other model types (likelihood-ratio test), to help you decide. It only shows the numbers.
+
+```{r inter-other, eval=FALSE}
+# glm (the original y): a small p-value = the interaction helps
+anova(glm(reformulate(base_terms, TARGET),                  family = GLM_FAMILY, data = dat),
+      glm(reformulate(c(base_terms, INTER_TEST), TARGET),   family = GLM_FAMILY, data = dat), test = "Chisq")
+
+# mixed model (the transformed y, a random intercept per group)
+if (!is.null(GROUP)) {
+  re <- paste0("(1 | ", GROUP, ")")
+  m0 <- lme4::lmer(reformulate(c(base_terms, re), ".y"),               dat, REML = FALSE)
+  m1 <- lme4::lmer(reformulate(c(base_terms, INTER_TEST, re), ".y"),   dat, REML = FALSE)
+  anova(m0, m1)
+}
+```
+
+#### Add the pair (only if you want it)
+
+```{r inter-add, eval=FALSE}
+# Run this chunk ONLY if you want the pair of the LAST run of inter-test (INTER_TEST). To leave the pair out: do not run it.
+INTER_SEL <- unique(c(setdiff(INTER_SEL, same_inter), INTER_TEST))              # (the same pair in the other order is replaced, not repeated)
+RHS_FINAL <- unique(c(RHS, unlist(strsplit(INTER_SEL, ":")), INTER_SEL))        # THE FORMULA FROM NOW ON
+# To take one out later:  INTER_SEL <- setdiff(INTER_SEL, "a:b")   and run the RHS_FINAL line again
+
+INTER_SEL          # the interactions kept so far
+RHS_FINAL          # the formula from now on
+```
+
+### OPTION 2: scan the pairs of the selected variables
+
+```{r inter-scan}
+# Which variables are tried in pairs?  FALSE: the variables of the selected formula.  TRUE: ALL the variables of NUM and CAT.
+# (A variable can matter only through an interaction, for example "weekend" that helps in one kind of place and hurts in another:
+#  its own effect cancels out, so section 3 may have dropped it. TRUE finds such a variable.)
+SCAN_ALL <- FALSE
+vars   <- if (SCAN_ALL) c(NUM, CAT) else all.vars(formula_sel)[-1]
+m_base <- lm(reformulate(unique(c(RHS, vars)), ".y"), data = dat)       # the model with the main effects of all these variables
+
+# A variable that never changes inside a group (a station's capacity ...) can only separate the groups. The interaction of TWO such variables
+# only builds the group ID again (the group effect of section 8 does that already, and the p-value is meaningless): leave those pairs out.
+group_level <- setNames(rep(FALSE, length(vars)), vars)
+if (!is.null(GROUP)) group_level <- sapply(vars, function(v) all(tapply(dat[[v]], dat[[GROUP]], n_distinct) == 1))
+
+pair_terms <- NULL
+if (length(vars) >= 2) {
+  all_pairs  <- combn(vars, 2, simplify = FALSE)                          # all pairs of variables
+  ok_pairs   <- Filter(function(p) !all(group_level[p]), all_pairs)       # without the pairs of two group-level variables
+  pair_terms <- sapply(ok_pairs, paste, collapse = ":")                   # "a:b"
+}
+
+if (length(pair_terms) > 0) {
+  inter_tab <- as.data.frame(add1(m_base, scope = reformulate(c(unique(c(RHS, vars)), pair_terms)), test = "F"))[-1, ]   # [-1, ] removes the row "<none>"
+  inter_tab <- inter_tab[order(inter_tab[["Pr(>F)"]]), c("Df", "AIC", "F value", "Pr(>F)")]
+  round(head(inter_tab, 15), 4)                                           # the 15 pairs with the smallest p-value
+}
+```
+
+```{r inter-scan-add}
+INTER_ADD <- character(0)    # <-- YOUR DECISION: the interactions of the table above to add, for example c("day_off:station_type"). character(0) = none
+INTER_SEL <- c(INTER_SEL, INTER_ADD)
+pair_key  <- vapply(strsplit(INTER_SEL, ":"), function(p) paste(sort(p), collapse = ":"), character(1))   # "a:b" and "b:a" are the same interaction
+INTER_SEL <- INTER_SEL[!duplicated(pair_key)]                                                            # keep it only once
+RHS_FINAL <- unique(c(RHS, unlist(strsplit(INTER_SEL, ":")), INTER_SEL))    # THE FORMULA FROM NOW ON (an interaction brings the main effects of its two variables)
+
+INTER_SEL
+RHS_FINAL
+```
+## 8. The models
+
+### 8-1. The tools (you do not need to change them)
+
+Every model is built from **the same terms** (`RHS_FINAL`). Two functions do everything:
+
+- `fit_model(model, train)` fits a model on the training rows;
+- `predict_model(obj, test)` predicts the test rows **in the units of y** (it turns the transformed y back).
+
+| model | what it is | y it is trained on |
+|---|---|---|
+| `baseline` | the mean of the training y: the number to beat | y |
+| `lm` | ordinary least squares | transformed y |
+| `lasso` | lm that shrinks the coefficients; some become exactly 0 | transformed y |
+| `ridge` | lm that shrinks the coefficients; none becomes 0 | transformed y |
+| `glm` | a glm with `GLM_FAMILY` | y |
+| `mixed` | lm + a random intercept per `GROUP` | transformed y |
+| `glmm` | glm + a random intercept per `GROUP` | y |
+
+A group (station) that is not in the training rows gets the average effect.
+
+```{r tools}
+MODELS <- c("baseline", "lm", "lasso", "ridge", "glm", if (!is.null(GROUP)) c("mixed", "glmm"))
+
+# keep only the terms whose variables have at least 2 different values in the training rows
+keep_terms <- function(terms, tr) {
+  ok <- sapply(terms, function(t) all(sapply(all.vars(parse(text = t)[[1]]), function(v) n_distinct(tr[[v]]) > 1)))
+  if (any(ok)) terms[ok] else "1"
+}
+
+fit_model <- function(model, tr) {
+  terms <- keep_terms(RHS_FINAL, tr)
+  tr$.y <- to_t(tr[[TARGET]])                               # the transformed y
+  re    <- paste0("(1 | ", GROUP, ")")                      # a random intercept per group
+  X     <- function(d) model.matrix(reformulate(terms), d)[, -1, drop = FALSE]    # the numbers for lasso / ridge
+  set.seed(SEED)
+  fit <- switch(model,
+    baseline = mean(tr[[TARGET]]),
+    lm       = lm(reformulate(terms, ".y"), data = tr),
+    lasso    = glmnet::cv.glmnet(X(tr), tr$.y, alpha = 1),
+    ridge    = glmnet::cv.glmnet(X(tr), tr$.y, alpha = 0),
+    glm      = glm(reformulate(terms, TARGET), family = GLM_FAMILY, data = tr),
+    mixed    = lme4::lmer(reformulate(c(terms, re), ".y"), data = tr, REML = FALSE),
+    glmm     = lme4::glmer(reformulate(c(terms, re), TARGET), family = GLM_FAMILY, data = tr))
+  list(model = model, fit = fit, terms = terms)
+}
+
+predict_model <- function(obj, te) {
+  fit <- obj$fit
+  switch(obj$model,
+    baseline = rep(fit, nrow(te)),
+    lm       = from_t(suppressWarnings(predict(fit, te))),
+    lasso    = ,
+    ridge    = from_t(as.numeric(predict(fit, model.matrix(reformulate(obj$terms), te)[, -1, drop = FALSE], s = "lambda.min"))),
+    glm      = as.numeric(predict(fit, te, type = "response")),
+    mixed    = from_t(as.numeric(predict(fit, te, allow.new.levels = TRUE))),
+    glmm     = as.numeric(predict(fit, te, type = "response", allow.new.levels = TRUE)))
+}
+
+# fill the missing values with the TRAIN numbers, fit on train, predict test
+fit_predict <- function(model, train, test) {
+  d <- fill_missing(train, test)
+  predict_model(fit_model(model, d$train), d$test)
+}
+```
+
+### 8-2. Fit all the models on all of `raw` and look at them
+
+```{r fit-all}
+fits <- lapply(MODELS, function(m) fit_model(m, dat))
+names(fits) <- MODELS
+
+fitted_long <- do.call(rbind, lapply(MODELS, function(m)
+  data.frame(model = m, actual = dat[[TARGET]], fitted = predict_model(fits[[m]], dat))))
+fitted_long$model <- factor(fitted_long$model, levels = MODELS)
+
+# Actual vs fitted: the points should lie on the red line
+ggplot(fitted_long, aes(x = fitted, y = actual)) +
+  geom_point(size = 0.5) + geom_abline(slope = 1, intercept = 0, color = "red") +
+  facet_wrap(~ model) + labs(x = "fitted", y = "actual", title = "Actual vs fitted (all of raw)")
+
+# Residuals vs fitted: the points should scatter evenly around 0
+ggplot(fitted_long, aes(x = fitted, y = actual - fitted)) +
+  geom_point(size = 0.5) + geom_hline(yintercept = 0, color = "red") +
+  facet_wrap(~ model) + labs(x = "fitted", y = "residual (actual - fitted)", title = "Residuals vs fitted (all of raw)")
+```
+
+```{r coef-plots}
+# lasso and ridge: the coefficients (on the scale of the transformed y). A lasso coefficient of exactly 0 = the variable is dropped.
+coefs <- do.call(rbind, lapply(c("lasso", "ridge"), function(m) {
+  cf <- as.matrix(coef(fits[[m]]$fit, s = "lambda.min"))
+  data.frame(model = m, term = rownames(cf), coef = cf[, 1])
+}))
+coefs <- coefs[coefs$term != "(Intercept)", ]
+ggplot(coefs, aes(x = term, y = coef)) +
+  geom_col() + coord_flip() + facet_wrap(~ model) +
+  labs(x = "term", y = "coefficient", title = "lasso and ridge coefficients")
+
+# mixed model: the random intercept of every group (how much higher / lower the group is than the average)
+if (!is.null(GROUP)) {
+  re_df <- data.frame(group = rownames(lme4::ranef(fits$mixed$fit)[[GROUP]]), effect = lme4::ranef(fits$mixed$fit)[[GROUP]][, 1])
+  ggplot(re_df, aes(x = reorder(group, effect), y = effect)) +
+    geom_point() + coord_flip() +
+    labs(x = GROUP, y = "random intercept", title = "mixed model: the effect of every group")
+}
+```
+
+## 9. Model comparison: the moving window
+
+The models are compared on rows they **did not see**. With a time column: the model is trained on the last `WINDOW` days, predicts the next `TEST_DAYS` days, and the window moves forward; all the predictions are collected and then scored. Without a time column: K-fold.
+
+The 5 scores (computed on **y in its own units**, after the transformation is turned back):
+
+| score | meaning |
+|---|---|
+| `RMSE` | the typical error; big errors count more. Smaller is better |
+| `MAE` | the average of the absolute errors. Smaller is better |
+| `MAPE` | the average error in % of y (rows with y = 0 are left out). Smaller is better |
+| `R2` | 1 = perfect, 0 = as good as the mean of y, negative = worse than the mean. Larger is better |
+| `Bias` | the average of (prediction - actual): positive = the model predicts too high. Close to 0 is good |
+
+```{r cv-tools}
+metrics <- function(y, p) {
+  e <- p - y
+  c(RMSE = sqrt(mean(e^2)),
+    MAE  = mean(abs(e)),
+    MAPE = 100 * mean(abs(e[y != 0]) / abs(y[y != 0])),
+    R2   = 1 - sum(e^2) / sum((y - mean(y))^2),
+    Bias = mean(e))
+}
+
+# The moving window: for every block of TEST_DAYS days from `from` to `to`, train on the WINDOW days before the block and predict the block
+run_sliding <- function(model, data, from, to) {
+  out   <- NULL
+  start <- from
+  while (start <= to) {
+    end   <- min(start + TEST_DAYS - 1, to)
+    train <- data[data$.day >= start - WINDOW & data$.day < start, ]
+    test  <- data[data$.day >= start & data$.day <= end, ]
+    train <- train[!is.na(train[[TARGET]]), ]
+    test  <- test[!is.na(test[[TARGET]]), ]
+    if (nrow(train) > 0 && nrow(test) > 0) {
+      out <- rbind(out, data.frame(day = test$.day, y = test[[TARGET]], pred = fit_predict(model, train, test)))
+    }
+    start <- end + 1
+  }
+  out
+}
+
+# Without a time column: K-fold on raw
+run_kfold <- function(model) {
+  set.seed(SEED)
+  fold <- sample(rep(1:FOLDS, length.out = nrow(raw)))
+  out  <- NULL
+  for (k in 1:FOLDS) {
+    test <- raw[fold == k, ]
+    out  <- rbind(out, data.frame(y = test[[TARGET]], pred = fit_predict(model, raw[fold != k, ], test)))
+  }
+  out
+}
+
+run_cv <- function(model) {
+  if (HAS_TIME) run_sliding(model, raw, from = min(raw$.day) + WINDOW, to = max(raw$.day)) else run_kfold(model)
+}
+```
+
+```{r cv-run}
+if (HAS_TIME) stopifnot("raw has fewer days than WINDOW: lower WINDOW in the settings" = as.numeric(max(raw$.day) - min(raw$.day)) > WINDOW)
+cv_pred <- list()
+for (m in MODELS) { cv_pred[[m]] <- run_cv(m); cat(m, "") }       # (this takes a while: one fit for every model and every block)
+cat("\n")
+
+cv_table <- t(sapply(cv_pred, function(p) metrics(p$y, p$pred)))
+cv_table <- cv_table[order(cv_table[, "RMSE"]), ]
+round(cv_table, 3)
+```
+
+```{r cv-plot}
+# the RMSE of every model (smaller is better)
+cv_df <- data.frame(model = rownames(cv_table), RMSE = cv_table[, "RMSE"])
+ggplot(cv_df, aes(x = reorder(model, RMSE), y = RMSE)) +
+  geom_col() + labs(x = "model", y = "RMSE", title = "Moving window: RMSE of every model")
+
+# actual vs predicted of every model (the predictions the models made for rows they did not see)
+cv_long <- do.call(rbind, lapply(names(cv_pred), function(m) data.frame(model = m, y = cv_pred[[m]]$y, pred = cv_pred[[m]]$pred)))
+ggplot(cv_long, aes(x = pred, y = y)) +
+  geom_point(size = 0.4) + geom_abline(slope = 1, intercept = 0, color = "red") +
+  facet_wrap(~ model) + labs(x = "predicted", y = "actual", title = "Moving window: actual vs predicted")
+```
+
+### 9-1. The final model: the coefficients
+
+The model whose coefficients you want to read: write its name in `FINAL` (you decide: it is not chosen by a score). The model is the one fitted on all of `dat` in section 8-2. It gives its `summary()` (lm, glm, mixed, glmm). lasso and ridge have no `summary()`: they give their coefficients (a lasso coefficient of exactly 0 = the variable is dropped).
+
+Reading an estimate: lm, lasso, ridge and mixed are fitted on the transformed y (5-1): with the log, one more unit of x multiplies y by `exp(estimate)`. glm and glmm (log link) are fitted on the original y: one more unit of x multiplies y by `exp(estimate)`, too. A categorical column: the difference to its first category.
+
+```{r final-model}
+FINAL <- "lm"      # <-- YOUR DECISION: lm | glm | mixed | glmm | lasso | ridge
+fit_final <- fits[[FINAL]]$fit
+if (FINAL %in% c("lasso", "ridge")) coef(fit_final, s = "lambda.min") else summary(fit_final)   # lasso / ridge: the coefficients, the others: summary()
+```
+
+## 10. The holdout (once)
+
+**Open the holdout only when the analysis above is finished.** Same rule as in section 9: the models are trained on the last `WINDOW` days before every block of `TEST_DAYS` days of the holdout (the days of the holdout that are already past are used as training days, as in real life). Nothing is chosen with these numbers: they only tell how good the final model really is.
+
+```{r holdout}
+holdout <- readRDS("holdout.rds")
+
+if (HAS_TIME) {
+  holdout$.day <- as.Date(holdout[[TIME]])
+  full <- rbind(raw, holdout)                                                   # raw followed by holdout
+  hold_pred <- lapply(MODELS, function(m) run_sliding(m, full, from = min(holdout$.day), to = max(holdout$.day)))
+} else {
+  hold_pred <- lapply(MODELS, function(m) data.frame(y = holdout[[TARGET]], pred = fit_predict(m, raw, holdout)))   # trained on all of raw
+}
+names(hold_pred) <- MODELS
+
+hold_table <- t(sapply(hold_pred, function(p) metrics(p$y, p$pred)))
+hold_table <- hold_table[order(hold_table[, "RMSE"]), ]
+round(hold_table, 3)
+```
+
+```{r holdout-plot}
+# actual vs predicted of every model
+hold_long <- do.call(rbind, lapply(names(hold_pred), function(m) data.frame(model = m, y = hold_pred[[m]]$y, pred = hold_pred[[m]]$pred)))
+ggplot(hold_long, aes(x = pred, y = y)) +
+  geom_point(size = 0.4) + geom_abline(slope = 1, intercept = 0, color = "red") +
+  facet_wrap(~ model) + labs(x = "predicted", y = "actual", title = "Holdout: actual vs predicted")
+
+# ===== The model to look at in the plots below: CHANGE HERE (it is not chosen by a score: you decide) =====
+BEST <- "lm"       # <-- YOUR DECISION: one of MODELS: baseline | lm | lasso | ridge | glm | mixed | glmm
+stopifnot("BEST must be one of the models of hold_pred" = BEST %in% names(hold_pred))
+# =========================================================================================================
+
+# over time: the daily mean of the actual y and of the prediction of the model BEST
+if (HAS_TIME) {
+  p         <- hold_pred[[BEST]]
+  actual    <- stats::aggregate(y ~ day,    data = p, FUN = base::mean)
+  predicted <- stats::aggregate(pred ~ day, data = p, FUN = base::mean)
+
+  daily <- rbind(
+    data.frame(day = actual$day,    value = actual$y,        what = "actual"),
+    data.frame(day = predicted$day, value = predicted$pred, what = "predicted")
+  )
+  ggplot(daily, aes(x = day, y = value, color = what)) +
+    geom_line() + labs(x = "day", y = paste("daily mean of", TARGET), title = paste("Holdout over time:", BEST))
+}
+
+# the residuals of the model BEST on the holdout (residual = actual - predicted)
+p       <- hold_pred[[BEST]]
+p$resid <- p$y - p$pred
+
+# residual vs predicted: the points should scatter evenly around 0
+ggplot(p, aes(x = pred, y = resid)) +
+  geom_point(size = 0.5) + geom_hline(yintercept = 0, color = "red") +
+  labs(x = "predicted", y = "residual (actual - predicted)", title = paste("Holdout residuals vs predicted:", BEST))
+
+# residual over time: they should not drift or wave over time
+if (HAS_TIME) {
+  ggplot(p, aes(x = day, y = resid)) +
+    geom_point(size = 0.5) + geom_hline(yintercept = 0, color = "red") +
+    labs(x = "day", y = "residual (actual - predicted)", title = paste("Holdout residuals over time:", BEST))
+}
+```
+
+# Part B. Classification (the TARGET is a category)
+
+Use Part B when the outcome is a **category**: 0 / 1 (two classes), 1, 2, ..., K (several classes) or text. **Run Part B instead of Part A** (not after it): it has its own settings, and it starts from the same files of the EDA template (`raw.rds`, `roles.rds` and, at the very end, `holdout.rds`). The same code handles two classes and several classes (`BINARY` is `TRUE` for two classes).
+
+**Contents of Part B**
+
+- B-0. Packages and settings
+- B-1. Load `raw` (and an example: a category made from a number)
+- B-2. Prepare `dat`
+- B-3. Variable selection (forward / backward, AIC / BIC)
+- B-4. Check the assumptions
+- B-5. A light try: transform the numeric x
+- B-6. Outliers (the rows the model gets wrong, and how they differ from the others)
+- B-7. Interactions
+- B-8. The models, fitted on all of `raw`, and their plots
+- B-9. Model comparison: moving window (train = the last 60 days)
+- B-10. The holdout (once)
+
+- Same steps as Part A, with a logistic regression instead of an lm. **There is no Box-Cox:** the target is not a number.
+- **You decide the analysis.** The places where you decide are marked `# <-- YOUR DECISION`: `SELECTED` (B-3), `X_TRANS` (B-5), `P_LIMIT` (B-6), `COLUMN1` / `COLUMN2` / `INTER_ADD` (B-7), `FINAL` (B-9), `BEST` (B-10).
+- **Time series is the default** (same as Part A): the models are trained on the last `WINDOW` days before the days they predict. Without a time column K-fold is used.
+- The EDA template does not know that the TARGET is a category: ignore what does not fit (for example the numeric statistics of the target). It only has to write `raw.rds`, `holdout.rds` and `roles.rds`.
+
+**What to change for a new data set (and where it is)**
+
+| what | where |
+|---|---|
+| `TARGET` (a category), `TIME` (`NULL` = no time column), `GROUP` (`NULL` = none) | chunk `b-settings` (B-0): the three required settings |
+| the class that counts as "positive" (two classes), the cut-off of the probability | `b-settings`: `POSITIVE`, `THRESHOLD` |
+| the length of the moving window, the number of days predicted at once | `b-settings`: `WINDOW`, `TEST_DAYS` |
+| a category made from a number (example only) | B-1, chunk `b-demo-target`: **delete it** if your TARGET is already a category |
+| the numeric / categorical predictors | the EDA template wrote them to `roles.rds`. To use your own lists, write `NUM <- c(...)` and `CAT <- c(...)` in chunk `b-load-raw` |
+| which variable-selection result | B-3, chunk `b-select-final`: `SELECTED` |
+| which transformations of the x | B-5, chunk `b-x-trans`: `X_TRANS` |
+| how strict the outlier candidates are | B-6, chunk `b-outlier-check`: `P_LIMIT` |
+| which interactions | B-7: option 1 = chunk `b-inter-test` (`COLUMN1`, `COLUMN2`, then `b-inter-add`), option 2 = chunks `b-inter-scan` and `b-inter-scan-add` (`INTER_ADD`). Both fill `INTER_SEL` |
+| which model to read the coefficients of / to look at in the holdout plots | B-9-1, chunk `b-final-model`: `FINAL` / B-10, chunk `b-holdout-plot`: `BEST` |
+
+| name | meaning |
+|---|---|
+| `CLASSES` | the classes of the target, for example `"1" "2" "3"` |
+| `BINARY` | `TRUE` if there are two classes |
+| the others | the same as in Part A: `raw`, `holdout`, `dat` (raw ready for the models), `full` (raw followed by holdout), `NUM`, `CAT` |
+
+## B-0. Packages and settings
+
+```{r b-settings}
+# install.packages(c("tidyverse", "glmnet", "lme4", "nnet", "rpart", "MASS", "car", "pROC"))     # run once if a package is missing
+library(tidyverse)
+options(width = 150)
+
+# ===== Settings =====
+SEED       <- 0
+TARGET     <- "demand_class"       # the outcome (y): a category. 0 / 1, 1..K or text. (The example below makes it from rentals)
+TIME       <- "date"               # the time column. NULL if the data has no time column
+GROUP      <- "station_id"         # a column whose values repeat (the same station / customer ...). NULL if none
+
+POSITIVE   <- NULL                 # two classes: the class that counts as "positive" (NULL = the last class, for 0 / 1 it is 1)
+THRESHOLD  <- 0.5                  # two classes: a row is predicted "positive" if its probability is larger than this. A smaller number finds more positives
+
+WINDOW     <- 60                   # moving window: the models are trained on the last 60 days before the days they predict
+TEST_DAYS  <- 7                    # ... and predict the next 7 days, then the window moves forward by 7 days
+FOLDS      <- 5                    # K-fold (only used when there is no time column)
+# ====================
+
+HAS_TIME <- !is.null(TIME)
+set.seed(SEED)
+```
+
+## B-1. Load `raw`
+
+```{r b-load-raw}
+raw   <- readRDS("raw.rds")         # written by the EDA template (section 11-4)
+roles <- readRDS("roles.rds")
+NUM   <- roles$NUM                  # numeric predictors   (your own list: NUM <- c("temp_c", "rain_mm"))
+CAT   <- roles$CAT                  # categorical predictors (your own list: CAT <- c("station_type"))
+
+if (HAS_TIME) {
+  raw <- raw[order(raw[[TIME]]), ]
+  raw$.day <- as.Date(raw[[TIME]])  # the day of every row (the moving window works with days)
+}
+```
+
+**Example only: a category target made from a number.** The bike data has a numeric outcome (`rentals`). To have something to classify, the chunk below cuts it into classes `1, 2, ..., N_DEMO` (low ... high) at quantiles **of `raw`**; the holdout gets the same cut-offs (section B-10). **If your own TARGET is already a category (0 / 1, 1..K or text), delete this chunk** and write its name in `TARGET` in the settings.
+
+```{r b-demo-target}
+NUMERIC_Y  <- "rentals"                                   # the numeric column the category is made from
+N_DEMO     <- 3                                           # the number of classes (2 = low / high, 3 = low / mid / high ...)
+CUTS       <- quantile(raw[[NUMERIC_Y]], (1:(N_DEMO - 1)) / N_DEMO, na.rm = TRUE)     # the cut-offs: learned on raw only
+make_class <- function(d) as.integer(cut(d[[NUMERIC_Y]], c(-Inf, CUTS, Inf)))        # 1, 2, ..., N_DEMO
+raw[[TARGET]] <- make_class(raw)
+NUM <- setdiff(NUM, NUMERIC_Y)                            # the number the category was made from must not be a predictor
+CAT <- setdiff(CAT, NUMERIC_Y)
+```
+
+```{r b-classes}
+NUM <- setdiff(NUM, TARGET)                               # the target is not a predictor
+CAT <- setdiff(CAT, TARGET)
+stopifnot(all(c(TARGET, NUM, CAT, GROUP) %in% names(raw)))
+
+# The classes of the target. The same order is used everywhere (also for the holdout).
+raw <- raw[!is.na(raw[[TARGET]]), ]
+CLASSES <- levels(factor(raw[[TARGET]]))
+BINARY  <- length(CLASSES) == 2
+if (BINARY && is.null(POSITIVE)) POSITIVE <- CLASSES[2]
+raw[[TARGET]] <- factor(raw[[TARGET]], levels = CLASSES)
+
+cat("raw:", nrow(raw), "rows | numeric predictors:", length(NUM), "| categorical predictors:", length(CAT), "\n")
+cat("classes:", CLASSES, if (BINARY) paste("| positive class:", POSITIVE) else "(several classes)", "\n")
+round(table(raw[[TARGET]]) / nrow(raw), 3)            # the share of every class: a very small class is hard to predict
+```
+
+## B-2. Prepare `dat`
+
+There is **nothing to decide here: just run the chunk.** It makes two things:
+
+- `dat`: `raw` with the categorical columns turned into factors (the form the models need). The missing values of the predictors were already filled in the EDA template (its section 11), so there is normally nothing left to fill. Sections B-3 to B-8 use `dat`.
+- `fill_missing(train, test)`: used again inside every model of sections B-8 to B-10, just before the model is fitted. It makes the categories the same in train and test (a category that is not in train becomes the filler). It is also a **safety net**: a predictor value that is still missing is filled with the **mean of the training rows** (a categorical column: the new category `"Missing"`, or the most frequent category if there was no missing value in the training rows).
+
+The outcome (`TARGET`) is never filled.
+
+```{r b-fill-missing}
+most_common <- function(x) names(sort(table(x), decreasing = TRUE))[1]
+
+fill_missing <- function(train, test) {
+  for (col in NUM) {
+    m <- mean(train[[col]], na.rm = TRUE)                 # the mean of the TRAIN rows
+    train[[col]][is.na(train[[col]])] <- m
+    test[[col]][is.na(test[[col]])]   <- m
+  }
+  for (col in CAT) {
+    train[[col]] <- as.character(train[[col]])
+    test[[col]]  <- as.character(test[[col]])
+    fill <- if (any(is.na(train[[col]]))) "Missing" else most_common(train[[col]])
+    train[[col]][is.na(train[[col]])] <- fill
+    test[[col]][is.na(test[[col]]) | !(test[[col]] %in% train[[col]])] <- fill    # NA, or a category that is not in train
+    train[[col]] <- factor(train[[col]])
+    test[[col]]  <- factor(test[[col]], levels = levels(train[[col]]))             # the same levels in train and test
+  }
+  list(train = train, test = test)
+}
+
+dat <- fill_missing(raw, raw)$train                       # raw with factors (and anything that is still missing filled)
+
+# check: nothing should be missing in the predictors (0 = the EDA template did its job)
+cat("missing values in the predictors: raw", sum(is.na(raw[c(NUM, CAT)])), "| dat", sum(is.na(dat[c(NUM, CAT)])), "\n")
+```
+
+## B-3. Variable selection (forward / backward, AIC / BIC)
+
+Four ways to select the variables of a **logistic regression** (two classes: `glm`; several classes: `nnet::multinom`):
+
+- **forward**: start from no variable and add the variable that helps most, until nothing helps;
+- **backward**: start from all variables and remove the one that hurts least, until every one is needed;
+- **AIC** keeps more variables, **BIC** keeps fewer (a bigger penalty for every variable).
+
+**The scores that compare the models.** k = number of parameters, n = number of rows, L = the maximized likelihood. Both are smaller = better.
+
+| score | formula | pros | cons |
+|---|---|---|---|
+| **AIC** | `AIC = 2k - 2 ln(L)` | Light penalty: keeps more variables, good for prediction | Can keep noise variables (overfit); a bigger model is harder to explain |
+| **BIC** | `BIC = k ln(n) - 2 ln(L)` | Heavier penalty (it grows with n, and it is bigger than the one of AIC when n >= 8): a simpler model that is easy to explain. With a lot of data it finds the true model (if it is among the candidates) | May drop weak but useful variables (underfit), which can cost prediction accuracy |
+
+The adjusted R^2 (`1 - (1 - R^2) (n - 1) / (n - p - 1)`) exists only for lm, so it is not used here.
+
+**Our goal is prediction, so AIC is the default** (`SELECTED <- "forward_AIC"` below). BIC gives the simpler alternative. The final choice among the models is made later, with the cross-validated LogLoss (B-9).
+
+```{r b-select-four}
+if (BINARY) {
+  m_null <- glm(reformulate("1", TARGET),            family = binomial, data = dat)
+  m_full <- glm(reformulate(c(NUM, CAT), TARGET),    family = binomial, data = dat)
+} else {
+  m_null <- nnet::multinom(reformulate("1", TARGET),         data = dat, trace = FALSE)
+  m_full <- nnet::multinom(reformulate(c(NUM, CAT), TARGET), data = dat, trace = FALSE)
+}
+n <- nrow(dat)
+
+up  <- list(lower = ~ 1, upper = formula(m_full))
+sel <- list(
+  forward_AIC  = MASS::stepAIC(m_null, scope = up, direction = "forward",  trace = FALSE),
+  forward_BIC  = MASS::stepAIC(m_null, scope = up, direction = "forward",  trace = FALSE, k = log(n)),
+  backward_AIC = MASS::stepAIC(m_full, direction = "backward", trace = FALSE),
+  backward_BIC = MASS::stepAIC(m_full, direction = "backward", trace = FALSE, k = log(n)))
+sel$full <- m_full
+
+# the four results and the full model side by side
+data.frame(n_terms = sapply(sel, function(m) length(attr(terms(m), "term.labels"))),
+           AIC     = round(sapply(sel, AIC), 1),
+           BIC     = round(sapply(sel, BIC), 1))
+
+for (nm in names(sel)) cat(nm, ":", attr(terms(sel[[nm]]), "term.labels"), "\n\n")
+```
+
+```{r b-select-final}
+SELECTED <- "forward_AIC"      # <-- YOUR DECISION: "forward_AIC" | "forward_BIC" | "backward_AIC" | "backward_BIC" | "full"
+
+formula_sel <- formula(sel[[SELECTED]])                  # the selected formula: everything below is built on it
+sel_terms   <- attr(terms(formula_sel), "term.labels")   # its terms
+formula_sel
+```
+
+## B-4. Check the assumptions
+
+A logistic regression does not need normal residuals. What matters: enough rows in every class, predictors that are not copies of each other, a straight-line relation between a numeric x and the **log-odds**, and no single row that pulls the fit.
+
+```{r b-assumptions}
+# 1 The classes: a class with very few rows is hard to learn
+barplot(table(dat[[TARGET]]), main = paste("Rows in every class of", TARGET), xlab = TARGET, ylab = "count")
+
+# 2 Variance inflation factor: larger than 5-10 = the variable is explained by the other variables (it does not depend on the target)
+vif_fit <- lm(reformulate(sel_terms, ".code"), data = transform(dat, .code = as.integer(dat[[TARGET]])))
+tryCatch(car::vif(vif_fit), error = function(e) "VIF cannot be computed: some columns are explained by the others (aliased). Look for two variables with the same information.")
+
+num_in <- intersect(NUM, all.vars(formula_sel))                      # the numeric variables of the selected formula
+
+if (BINARY) {
+  # 3 Is the log-odds a straight line in x? The rows are cut in 10 groups of x; the points should lie roughly on a straight line
+  y01 <- as.integer(dat[[TARGET]] == POSITIVE)
+  par(mfrow = c(2, 2))
+  for (x in head(num_in[sapply(dat[num_in], n_distinct) > 2], 4)) {
+    cuts <- unique(quantile(dat[[x]], seq(0, 1, 0.1)))
+    if (length(cuts) < 3) next
+    grp  <- cut(dat[[x]], cuts, include.lowest = TRUE)
+    p    <- tapply(y01, grp, mean)
+    plot(tapply(dat[[x]], grp, mean), log((p + 0.01) / (1 - p + 0.01)), xlab = x, ylab = "log-odds of the positive class", main = x)
+  }
+  par(mfrow = c(1, 1))
+
+  # 4 Cook's distance: a few very tall bars are rows that pull the fit
+  plot(glm(formula_sel, family = binomial, data = dat), which = 4)
+}
+```
+
+## B-5. A light try: transform the numeric x
+
+For every numeric variable of the selected formula: does adding `x^2`, `log(x)`, `sqrt(x)` or `exp(x)` help? A negative `AIC_change` = better. A small `p_value` = the new term is useful.
+
+```{r b-x-trans}
+fit_terms <- function(terms) {                              # a logistic regression with these terms
+  f <- reformulate(terms, TARGET)
+  if (BINARY) glm(f, family = binomial, data = dat) else nnet::multinom(f, data = dat, trace = FALSE)
+}
+m_sel <- fit_terms(sel_terms)
+
+tried <- NULL
+for (x in num_in) {
+  v <- dat[[x]]
+  if (n_distinct(v) <= 2) next                              # a 0/1 variable: nothing to transform
+  terms_try <- paste0("I(", x, "^2)")                       # x squared
+  if (min(v) > 0)  terms_try <- c(terms_try, paste0("log(", x, ")"))     # only possible for positive x
+  if (min(v) >= 0) terms_try <- c(terms_try, paste0("sqrt(", x, ")"))    # only possible for x >= 0
+  if (max(v) < 20) terms_try <- c(terms_try, paste0("exp(", x, ")"))     # (a big x makes exp(x) explode)
+  for (tt in terms_try) {
+    m2    <- fit_terms(c(sel_terms, tt))
+    lr    <- 2 * (as.numeric(logLik(m2)) - as.numeric(logLik(m_sel)))                 # likelihood-ratio test of the new term
+    df_lr <- attr(logLik(m2), "df") - attr(logLik(m_sel), "df")
+    tried <- rbind(tried, data.frame(term = tt, AIC_change = round(AIC(m2) - AIC(m_sel), 1), p_value = round(pchisq(lr, df_lr, lower.tail = FALSE), 4)))
+  }
+}
+if (!is.null(tried)) tried[order(tried$AIC_change), ]
+
+X_TRANS <- character(0)      # <-- YOUR DECISION: the terms you want to add, for example c("I(temp_c^2)", "log(rain_mm + 1)"). character(0) = none
+```
+
+### B-5-2. Mid-check: the logistic regression so far (summary only)
+
+A look at the model **so far**: the selected variables (B-3) + `X_TRANS` (above). Only the `summary()`: no plots. The outliers (B-6) and the interactions (B-7) are not in it yet. Reading an estimate: one more unit of x multiplies the odds of the class by `exp(estimate)` (two classes: the odds of the second class; several classes: each class against the first one). A categorical column: the difference to its first category.
+
+```{r b-mid-check}
+m_mid <- fit_terms(c(sel_terms, X_TRANS))              # glm (two classes) or nnet::multinom (several classes)
+summary(m_mid)
+```
+
+## B-6. Outliers
+
+Outliers are looked at **only through the target**, with the logistic regression we already have: the selected variables (B-3) + `X_TRANS` (B-5). The TARGET is a category, so an **outlier candidate** is a row that this model gets **very wrong**: the probability it gives to the **true class** is smaller than `P_LIMIT` (0.10 means: the model said "this is almost surely not the class it really is").
+
+The candidates are collected in the table `out_rows` (the worst first): **look at them** (`View(out_rows)`). Then the chunk shows how they differ from the normal rows, column by column (for example: the mean of `temp_c` is 18 in the normal rows and 22 in the candidates), and which classes they belong to. Nothing is removed from `dat`.
+
+If one class is rare, its rows will be flagged more often: look at the class rows of the share table, or lower `P_LIMIT`.
+
+```{r b-outlier-check}
+P_LIMIT <- 0.10     # <-- CHANGE HERE (optional): a row is an outlier candidate if the probability of its TRUE class is smaller than this
+
+# 1. the logistic regression (selected variables + X_TRANS) and the numbers of every row
+m_out <- fit_terms(c(sel_terms, X_TRANS))
+P     <- if (BINARY) { p <- predict(m_out, dat, type = "response"); cbind(1 - p, p) } else predict(m_out, dat, type = "probs")   # the probability of every class
+dat$.ptrue <- P[cbind(seq_len(nrow(dat)), match(as.character(dat[[TARGET]]), CLASSES))]      # the probability given to the TRUE class
+dat$.pred  <- CLASSES[max.col(P, ties.method = "first")]                                     # the most probable class
+dat$.out   <- (dat$.ptrue < P_LIMIT) %in% TRUE                                               # TRUE = outlier candidate
+cat(sum(dat$.out), "outlier candidates in", nrow(dat), "rows (", round(100 * mean(dat$.out), 1), "%)\n")
+
+# 2. the picture: the probability of the true class of every row (red = candidate)
+plot(if (HAS_TIME) dat$.day else seq_len(nrow(dat)), dat$.ptrue, pch = 16, cex = 0.5, col = ifelse(dat$.out, "red", "grey40"),
+     xlab = if (HAS_TIME) "day" else "row", ylab = "probability of the true class", main = "Probability of the true class (red = outlier candidate)")
+abline(h = P_LIMIT, lty = 2)
+
+# 2b. the proportion of outlier candidates in every month (x = month). For the day instead of the month: use the `# day` line and comment out the `# month` line.
+if (HAS_TIME) {
+  period <- lubridate::floor_date(dat$.day, "month")                  # month: the first day of the month of every row
+  # period <- dat$.day                                                # day: use this line INSTEAD of the line above
+  prop   <- tapply(dat$.out, period, mean)                            # the proportion of candidates in every month (0 to 1)
+  print(ggplot(data.frame(period = as.Date(names(prop)), proportion = as.numeric(prop)), aes(x = period, y = proportion)) +
+    geom_line() + geom_point() +
+    scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m", guide = guide_axis(check.overlap = TRUE)) +
+    labs(x = "period", y = "proportion of outlier candidates", title = "Outlier candidates over time"))
+}
+
+# 3. the candidates, collected (the worst first): LOOK AT THEM
+front    <- c(TIME, GROUP, TARGET, ".pred", ".ptrue")              # the columns to read first
+out_rows <- dat[dat$.out, c(front, setdiff(c(NUM, CAT), front))]
+out_rows <- out_rows[order(out_rows$.ptrue), ]
+head(out_rows, 20)
+# View(out_rows)                                                   # (optional) in RStudio: the whole table
+```
+
+```{r b-outlier-compare}
+# 4. numeric columns: the mean in the normal rows and in the outlier candidates
+if (any(dat$.out) && any(!dat$.out)) {
+  cmp <- data.frame(normal  = sapply(dat[!dat$.out, NUM], mean, na.rm = TRUE),
+                    outlier = sapply(dat[dat$.out,  NUM], mean, na.rm = TRUE))
+  cmp$diff_in_sd <- (cmp$outlier - cmp$normal) / sapply(dat[NUM], sd, na.rm = TRUE)       # the difference / the overall sd: below 0.2 tiny, above 0.8 large
+  print(round(cmp[order(-abs(cmp$diff_in_sd)), ], 2))                                     # the biggest differences first
+}
+
+# 5. categories (the classes of the TARGET too): what share of every category is an outlier candidate? (compare it with the overall share)
+if (any(dat$.out)) {
+  cat("\nthe overall share of candidates:", round(100 * mean(dat$.out), 1), "%\n")
+  share <- do.call(rbind, lapply(unique(c(CAT, GROUP, TARGET)), function(v) {
+    g     <- as.character(dat[[v]]);  g[is.na(g)] <- "NA"
+    n_all <- tapply(dat$.out, g, length)
+    n_out <- tapply(dat$.out, g, sum)
+    data.frame(column = v, category = names(n_all), n = as.vector(n_all), n_outlier = as.vector(n_out),
+               pct = round(100 * as.vector(n_out) / as.vector(n_all), 1))
+  }))
+  share <- share[share$n >= 5, ]                                                          # tiny categories are left out
+  print(head(share[order(-share$pct), ], 15), row.names = FALSE)                          # the 15 categories with the highest share
+  if (HAS_TIME) print(round(100 * tapply(dat$.out, format(dat$.day, "%Y-%m"), mean), 1))  # the share in every month
+}
+```
+
+**How to read the result**
+
+- Look at `out_rows` first: which class do the candidates really belong to, and which class did the model predict (`.pred`)? Are they one station, one period, one kind of day?
+- Numeric columns: a large `diff_in_sd` means the candidates live in a different part of that column. Categories: a `pct` much larger than the overall share means the candidates are concentrated there (the rows with `column` = the TARGET tell which classes).
+- **A clear pattern** = the model misses something that this column explains. Keep the rows and give the model that information: the variable (B-3), a transformation (B-5) or an **interaction** (next section).
+- **No pattern**: the candidates look random (a data error? a one-off event?). Check the rows by hand before you decide what to do.
+
+## B-7. Interactions
+
+An interaction `a:b` means: the effect of `a` is different for different values of `b`. There are **two options**, and both fill the same list `INTER_SEL` (the interactions you keep). Use one of them, or both, as many times as you like. (Outliers that are explained by two variables together, section B-6, are a good reason to test that pair.)
+
+- **OPTION 1: you choose the pair.** Write `COLUMN1` and `COLUMN2` (any two columns of `dat`, numeric or categorical), run the test, **look at the result, and decide**: run the chunk `b-inter-add` to add the pair, or skip it. Then go back to `COLUMN1` / `COLUMN2` and test the next pair.
+- **OPTION 2: scan.** The variables of the selected formula are tried in pairs, **one interaction at a time**, and the table shows the pairs with the smallest p-value. You write the ones you want in `INTER_ADD`.
+
+With many pairs (option 2) a few small p-values come by chance: prefer the very small ones that also make sense. The test is the likelihood-ratio test of the logistic regression (`glm`; several classes: `nnet::multinom`, which can take a while).
+
+```{r b-inter-start}
+# Run this chunk ONCE (it empties INTER_SEL): do NOT run it again after you have added interactions.
+RHS       <- c(sel_terms, X_TRANS)                                          # the terms until now
+INTER_SEL <- character(0)                                                   # the interactions kept (OPTION 1 and OPTION 2 add to it)
+RHS_FINAL <- unique(c(RHS, unlist(strsplit(INTER_SEL, ":")), INTER_SEL))    # THE FORMULA FROM NOW ON (an interaction brings the main effects of its two columns)
+```
+
+### OPTION 1: test the pair you choose
+
+The chunks of option 1 name specific columns (`temp_c`, `station_type` ...), so they are `eval = FALSE`: **they are not run when you knit**. Write your own columns and run them by hand. (They use `fit_terms()` of the chunk `b-x-trans`: run that chunk first.)
+
+```{r b-inter-test, eval=FALSE}
+# ===== The pair to test: CHANGE HERE, then run this chunk =====
+COLUMN1 <- "temp_c"            # <-- CHANGE HERE: any column (numeric or categorical)
+COLUMN2 <- "station_type"      # <-- CHANGE HERE: another column (numeric or categorical)
+# ==============================================================
+
+stopifnot("COLUMN1 and COLUMN2 must be two different columns" = COLUMN1 != COLUMN2,
+          "COLUMN1 and COLUMN2 must be columns of dat"        = all(c(COLUMN1, COLUMN2) %in% names(dat)))
+INTER_TEST <- paste(COLUMN1, COLUMN2, sep = ":")                            # "a:b"
+same_inter <- c(INTER_TEST, paste(COLUMN2, COLUMN1, sep = ":"))             # "a:b" and "b:a" are the same interaction
+inter_keep <- setdiff(INTER_SEL, same_inter)                                # the interactions kept before (without this one: it is the one tested)
+base_terms <- unique(c(RHS, COLUMN1, COLUMN2, unlist(strsplit(inter_keep, ":")), inter_keep))   # the model WITHOUT this interaction (the main effects of both columns are in)
+
+# A column that never changes inside a group (a station's capacity ...): the interaction of TWO such columns only builds the group ID again
+if (!is.null(GROUP) && all(sapply(c(COLUMN1, COLUMN2), function(v) all(tapply(dat[[v]], dat[[GROUP]], n_distinct) == 1)))) {
+  cat("WARNING: both columns never change inside a", GROUP, ": the p-value is meaningless\n")
+}
+
+# Likelihood-ratio test in the logistic regression: a small p-value = the interaction helps
+fit0  <- fit_terms(base_terms)
+fit1  <- fit_terms(c(base_terms, INTER_TEST))
+lr    <- 2 * (as.numeric(logLik(fit1)) - as.numeric(logLik(fit0)))          # how much better the fit gets
+df_lr <- attr(logLik(fit1), "df") - attr(logLik(fit0), "df")                # how many parameters were added
+p_lr  <- pchisq(lr, df_lr, lower.tail = FALSE)
+print(data.frame(Df = df_lr, AIC_change = round(AIC(fit1) - AIC(fit0), 1), LR = round(lr, 2), p_value = signif(p_lr, 3)), row.names = FALSE)
+cat("\n", INTER_TEST, ": p-value =", signif(p_lr, 3), "  -> add it? run the chunk b-inter-add (or skip it)\n")
+```
+
+#### (optional) The same pair in a mixed model (two classes)
+
+The **same** pair (`COLUMN1`, `COLUMN2`) in a mixed model (a random intercept per group), to help you decide. It only shows the numbers.
+
+```{r b-inter-other, eval=FALSE}
+if (BINARY && !is.null(GROUP)) {
+  re <- paste0("(1 | ", GROUP, ")")                         # a random intercept per group
+  m0 <- lme4::glmer(reformulate(c(base_terms, re), TARGET),               family = binomial, data = dat)
+  m1 <- lme4::glmer(reformulate(c(base_terms, INTER_TEST, re), TARGET),   family = binomial, data = dat)
+  anova(m0, m1)                                             # a small p-value = the interaction helps
+}
+```
+
+#### Add the pair (only if you want it)
+
+```{r b-inter-add, eval=FALSE}
+# Run this chunk ONLY if you want the pair of the LAST run of b-inter-test (INTER_TEST). To leave the pair out: do not run it.
+INTER_SEL <- unique(c(setdiff(INTER_SEL, same_inter), INTER_TEST))              # (the same pair in the other order is replaced, not repeated)
+RHS_FINAL <- unique(c(RHS, unlist(strsplit(INTER_SEL, ":")), INTER_SEL))        # THE FORMULA FROM NOW ON
+# To take one out later:  INTER_SEL <- setdiff(INTER_SEL, "a:b")   and run the RHS_FINAL line again
+
+INTER_SEL          # the interactions kept so far
+RHS_FINAL          # the formula from now on
+```
+
+### OPTION 2: scan the pairs of the selected variables
+
+```{r b-inter-scan}
+# Which variables are tried in pairs?  FALSE: the variables of the selected formula.  TRUE: ALL the variables of NUM and CAT.
+# (A variable can matter only through an interaction: its own effect cancels out, so section B-3 may have dropped it. TRUE finds such a variable.)
+SCAN_ALL <- FALSE
+vars <- if (SCAN_ALL) c(NUM, CAT) else all.vars(formula_sel)[-1]
+terms_base <- unique(c(RHS, vars))                          # the main effects of all these variables
+m_ref <- fit_terms(terms_base)                              # the model without any interaction
+
+# A variable that never changes inside a group (a station's capacity ...) can only separate the groups. The interaction of TWO such variables
+# only builds the group ID again (the group effect of section B-8 does that already, and the p-value is meaningless): leave those pairs out.
+group_level <- setNames(rep(FALSE, length(vars)), vars)
+if (!is.null(GROUP)) group_level <- sapply(vars, function(v) all(tapply(dat[[v]], dat[[GROUP]], n_distinct) == 1))
+
+pair_terms <- NULL
+if (length(vars) >= 2) {
+  all_pairs  <- combn(vars, 2, simplify = FALSE)                          # all pairs of variables
+  ok_pairs   <- Filter(function(p) !all(group_level[p]), all_pairs)       # without the pairs of two group-level variables
+  pair_terms <- sapply(ok_pairs, paste, collapse = ":")                   # "a:b"
+}
+
+# Every pair is added to the model, one at a time, and tested with the likelihood-ratio test.
+# (With several classes every pair is a new fit of a bigger model: this can take a minute or two.)
+inter_tab <- NULL
+for (pt in pair_terms) {
+  m2 <- tryCatch(fit_terms(c(terms_base, pt)), error = function(e) NULL)
+  if (is.null(m2)) next
+  lr    <- 2 * (as.numeric(logLik(m2)) - as.numeric(logLik(m_ref)))                  # how much better the fit gets
+  df_lr <- attr(logLik(m2), "df") - attr(logLik(m_ref), "df")                         # how many parameters were added
+  inter_tab <- rbind(inter_tab, data.frame(pair = pt, Df = df_lr, AIC = round(AIC(m2), 1), p_value = pchisq(lr, df_lr, lower.tail = FALSE)))
+}
+if (!is.null(inter_tab)) {
+  rownames(inter_tab) <- inter_tab$pair
+  inter_tab <- inter_tab[order(inter_tab$p_value), c("Df", "AIC", "p_value")]         # a small p-value = the interaction helps
+  round(head(inter_tab, 15), 4)                                                       # the 15 pairs with the smallest p-value
+}
+```
+
+```{r b-inter-scan-add}
+INTER_ADD <- character(0)    # <-- YOUR DECISION: the interactions of the table above to add, for example c("day_off:station_type"). character(0) = none
+INTER_SEL <- c(INTER_SEL, INTER_ADD)
+pair_key  <- vapply(strsplit(INTER_SEL, ":"), function(p) paste(sort(p), collapse = ":"), character(1))   # "a:b" and "b:a" are the same interaction
+INTER_SEL <- INTER_SEL[!duplicated(pair_key)]                                                            # keep it only once
+RHS_FINAL <- unique(c(RHS, unlist(strsplit(INTER_SEL, ":")), INTER_SEL))    # THE FORMULA FROM NOW ON (an interaction brings the main effects of its two variables)
+
+INTER_SEL
+RHS_FINAL
+```
+
+## B-8. The models
+
+### B-8-1. The tools (you do not need to change them)
+
+Every model is built from **the same terms** (`RHS_FINAL`). Two functions do everything:
+
+- `fit_model(model, train)` fits a model on the training rows;
+- `predict_model(obj, test)` gives, for every test row, the **probability of every class** (a table with one column per class).
+
+| model | what it is |
+|---|---|
+| `baseline` | the share of every class in the training rows: the number to beat |
+| `logit` | logistic regression (`glm`; several classes: `multinom`) |
+| `lasso` | logistic regression that shrinks the coefficients; some become exactly 0 |
+| `ridge` | logistic regression that shrinks the coefficients; none becomes 0 |
+| `tree` | a decision tree (`rpart`): easy to read |
+| `glmm` | logistic regression + a random intercept per `GROUP` (**two classes only**) |
+
+A group (station) that is not in the training rows gets the average effect. If a model cannot be fitted (for example a class with 1 row in the window) the baseline is used and counted in `n_fallback`.
+
+```{r b-tools}
+MODELS <- c("baseline", "logit", "lasso", "ridge", "tree", if (BINARY && !is.null(GROUP)) "glmm")
+n_fallback <- 0
+
+# keep only the terms whose variables have at least 2 different values in the training rows
+keep_terms <- function(terms, tr) {
+  ok <- sapply(terms, function(t) all(sapply(all.vars(parse(text = t)[[1]]), function(v) n_distinct(tr[[v]]) > 1)))
+  if (any(ok)) terms[ok] else "1"
+}
+
+fit_model <- function(model, tr) {
+  tr[[TARGET]] <- droplevels(tr[[TARGET]])                  # only the classes that are in the training rows
+  k     <- nlevels(tr[[TARGET]])
+  terms <- keep_terms(RHS_FINAL, tr)
+  f     <- reformulate(terms, TARGET)
+  re    <- paste0("(1 | ", GROUP, ")")                      # a random intercept per group
+  X     <- function(d) model.matrix(reformulate(terms), d)[, -1, drop = FALSE]    # the numbers for lasso / ridge
+  tree_vars <- unique(unlist(lapply(terms, function(t) all.vars(parse(text = t)[[1]]))))   # a tree does not use "a:b" or "I(x^2)"
+  set.seed(SEED)
+
+  fit <- NULL
+  if (k >= 2 && model != "baseline") {
+    fit <- tryCatch(switch(model,
+      logit = if (k == 2) glm(f, family = binomial, data = tr) else nnet::multinom(f, data = tr, trace = FALSE),
+      lasso = glmnet::cv.glmnet(X(tr), tr[[TARGET]], family = if (k == 2) "binomial" else "multinomial", alpha = 1),
+      ridge = glmnet::cv.glmnet(X(tr), tr[[TARGET]], family = if (k == 2) "binomial" else "multinomial", alpha = 0),
+      tree  = rpart::rpart(reformulate(tree_vars, TARGET), data = tr, method = "class"),
+      glmm  = lme4::glmer(reformulate(c(terms, re), TARGET), family = binomial, data = tr)),
+      error = function(e) NULL)
+    if (is.null(fit)) n_fallback <<- n_fallback + 1          # it could not be fitted: the baseline is used
+  }
+  if (is.null(fit)) {
+    model <- "baseline"
+    fit   <- table(tr[[TARGET]]) / nrow(tr)                  # the share of every class
+  }
+  list(model = model, fit = fit, terms = terms, classes = levels(tr[[TARGET]]), k = k)
+}
+
+# the probability of every class (a table with one column per class). A class that is not in the training rows gets a very small probability.
+predict_model <- function(obj, te) {
+  fit <- obj$fit; cl <- obj$classes
+  P <- switch(obj$model,
+    baseline = matrix(rep(as.numeric(fit), each = nrow(te)), nrow = nrow(te)),
+    logit    = if (obj$k == 2) { p <- predict(fit, te, type = "response"); cbind(1 - p, p) } else predict(fit, te, type = "probs"),
+    lasso    = ,
+    ridge    = { x <- model.matrix(reformulate(obj$terms), te)[, -1, drop = FALSE]
+                 if (obj$k == 2) { p <- as.numeric(predict(fit, x, s = "lambda.min", type = "response")); cbind(1 - p, p) }
+                 else predict(fit, x, s = "lambda.min", type = "response")[, , 1] },
+    tree     = predict(fit, te, type = "prob"),
+    glmm     = { p <- as.numeric(predict(fit, te, type = "response", allow.new.levels = TRUE)); cbind(1 - p, p) })
+  P <- matrix(as.numeric(P), nrow = nrow(te))
+  colnames(P) <- cl
+  full <- matrix(1e-6, nrow(te), length(CLASSES), dimnames = list(NULL, CLASSES))
+  full[, cl] <- P
+  full / rowSums(full)
+}
+
+# fill the missing values with the TRAIN numbers, fit on train, predict test
+fit_predict <- function(model, train, test) {
+  d <- fill_missing(train, test)
+  predict_model(fit_model(model, d$train), d$test)
+}
+
+# the predicted class: the most probable one (two classes: positive if its probability is larger than THRESHOLD)
+to_class <- function(P) {
+  if (BINARY) {
+    neg <- setdiff(CLASSES, POSITIVE)
+    factor(ifelse(P[, POSITIVE] > THRESHOLD, POSITIVE, neg), levels = CLASSES)
+  } else {
+    factor(CLASSES[max.col(P, ties.method = "first")], levels = CLASSES)
+  }
+}
+```
+
+### B-8-2. Fit all the models on all of `raw` and look at them
+
+```{r b-fit-all}
+fits <- lapply(MODELS, function(m) fit_model(m, dat))
+names(fits) <- MODELS
+P_all <- lapply(fits, function(o) predict_model(o, dat))        # the probabilities of every model (on all of raw: the models have seen these rows)
+
+# Confusion matrix of every model: the rows are the actual class, the columns the predicted class (a perfect model has numbers only on the diagonal)
+conf_long <- do.call(rbind, lapply(MODELS, function(m)
+  data.frame(model = m, as.data.frame(table(actual = dat[[TARGET]], predicted = to_class(P_all[[m]]))))))
+conf_long$model <- factor(conf_long$model, levels = MODELS)
+ggplot(conf_long, aes(x = predicted, y = actual, fill = Freq)) +
+  geom_tile() + geom_text(aes(label = Freq)) + facet_wrap(~ model) +
+  labs(x = "predicted class", y = "actual class", title = "Confusion matrices (all of raw)")
+```
+
+```{r b-fit-plots}
+if (BINARY) {
+  y01 <- as.integer(dat[[TARGET]] == POSITIVE)
+
+  # ROC curve: the closer to the upper left corner, the better; the diagonal = guessing
+  roc_long <- do.call(rbind, lapply(MODELS, function(m) {
+    r <- pROC::roc(y01, P_all[[m]][, POSITIVE], quiet = TRUE)
+    data.frame(model = m, fpr = 1 - r$specificities, tpr = r$sensitivities)
+  }))
+  ggplot(roc_long, aes(x = fpr, y = tpr, color = model)) +
+    geom_line() + geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(x = "false positive rate", y = "true positive rate", title = "ROC curves (all of raw)")
+
+  # The probability of the positive class for the rows of every actual class: the two groups should be far apart
+  prob_long <- do.call(rbind, lapply(MODELS, function(m) data.frame(model = m, actual = dat[[TARGET]], prob = P_all[[m]][, POSITIVE])))
+  ggplot(prob_long, aes(x = prob, fill = actual)) +
+    geom_histogram(bins = 30, position = "identity", alpha = 0.5) + facet_wrap(~ model) +
+    labs(x = paste("probability of", POSITIVE), y = "count", title = "Predicted probability by actual class (all of raw)")
+
+  # lasso and ridge: the coefficients (log-odds scale). A lasso coefficient of exactly 0 = the variable is dropped.
+  if (fits$lasso$model == "lasso") {
+    coefs <- do.call(rbind, lapply(c("lasso", "ridge"), function(m) {
+      cf <- as.matrix(coef(fits[[m]]$fit, s = "lambda.min"))
+      data.frame(model = m, term = rownames(cf), coef = cf[, 1])
+    }))
+    coefs <- coefs[coefs$term != "(Intercept)", ]
+    ggplot(coefs, aes(x = term, y = coef)) +
+      geom_col() + coord_flip() + facet_wrap(~ model) +
+      labs(x = "term", y = "coefficient", title = "lasso and ridge coefficients")
+  }
+
+  # mixed model: the random intercept of every group
+  if ("glmm" %in% MODELS && fits$glmm$model == "glmm") {
+    re_df <- data.frame(group = rownames(lme4::ranef(fits$glmm$fit)[[GROUP]]), effect = lme4::ranef(fits$glmm$fit)[[GROUP]][, 1])
+    ggplot(re_df, aes(x = reorder(group, effect), y = effect)) +
+      geom_point() + coord_flip() +
+      labs(x = GROUP, y = "random intercept", title = "glmm: the effect of every group")
+  }
+}
+```
+
+```{r b-tree-plot}
+# The decision tree: the questions it asks, from the top. (A tree made of the root only means: no question helped.)
+if (fits$tree$model == "tree") {
+  plot(fits$tree$fit, uniform = TRUE, margin = 0.1)
+  text(fits$tree$fit, use.n = TRUE, cex = 0.7)
+}
+```
+
+## B-9. Model comparison: the moving window
+
+The models are compared on rows they **did not see**. With a time column: the model is trained on the last `WINDOW` days, predicts the next `TEST_DAYS` days, and the window moves forward; all the predictions are collected and then scored. Without a time column: K-fold.
+
+The 5 scores (the predicted class is the most probable class; two classes: positive if the probability is larger than `THRESHOLD`):
+
+| score | meaning |
+|---|---|
+| `Accuracy` | the share of rows with the right class. Larger is better, but a model that always says the big class can look good |
+| `BalAcc` | balanced accuracy = the average, over the classes, of the share of the class found. Not fooled by a big class. Larger is better |
+| `F1` | two classes: the F1 of the positive class (precision and recall together); several classes: the average over the classes. Larger is better |
+| `AUC` | the chance that a row of the class gets a higher probability than a row of another class (several classes: the average over the classes, one against the rest). 0.5 = guessing, 1 = perfect. Larger is better |
+| `LogLoss` | punishes a confident wrong probability. Smaller is better |
+
+```{r b-cv-tools}
+metrics <- function(y, P) {                                 # y: a factor with the levels CLASSES, P: the probabilities
+  pred   <- to_class(P)
+  recall <- sapply(CLASSES, function(k) if (any(y == k)) mean(pred[y == k] == k) else NA)         # the share of every class found
+  prec   <- sapply(CLASSES, function(k) if (any(pred == k)) mean(y[pred == k] == k) else 0)
+  f1_k   <- ifelse(is.na(recall) | (prec + recall) == 0, 0, 2 * prec * recall / (prec + recall))
+  auc_k  <- sapply(CLASSES, function(k) if (length(unique(y == k)) < 2) NA else suppressMessages(as.numeric(pROC::auc(as.integer(y == k), P[, k], quiet = TRUE))))
+  p_true <- pmax(P[cbind(seq_along(y), match(as.character(y), CLASSES))], 1e-15)                   # the probability given to the TRUE class
+  c(Accuracy = mean(pred == y),
+    BalAcc   = mean(recall, na.rm = TRUE),
+    F1       = if (BINARY) unname(f1_k[POSITIVE]) else mean(f1_k[!is.na(recall)]),
+    AUC      = if (BINARY) unname(auc_k[POSITIVE]) else mean(auc_k, na.rm = TRUE),
+    LogLoss  = -mean(log(p_true)))
+}
+
+# The moving window: for every block of TEST_DAYS days from `from` to `to`, train on the WINDOW days before the block and predict the block
+run_sliding <- function(model, data, from, to) {
+  ys <- character(0); days <- as.Date(character(0)); Ps <- NULL
+  start <- from
+  while (start <= to) {
+    end   <- min(start + TEST_DAYS - 1, to)
+    train <- data[data$.day >= start - WINDOW & data$.day < start, ]
+    test  <- data[data$.day >= start & data$.day <= end, ]
+    train <- train[!is.na(train[[TARGET]]), ]
+    test  <- test[!is.na(test[[TARGET]]), ]
+    if (nrow(train) > 0 && nrow(test) > 0) {
+      ys   <- c(ys, as.character(test[[TARGET]]))
+      days <- c(days, test$.day)
+      Ps   <- rbind(Ps, fit_predict(model, train, test))
+    }
+    start <- end + 1
+  }
+  list(y = factor(ys, levels = CLASSES), P = Ps, day = days)
+}
+
+# Without a time column: K-fold on raw
+run_kfold <- function(model) {
+  set.seed(SEED)
+  fold <- sample(rep(1:FOLDS, length.out = nrow(raw)))
+  ys <- character(0); Ps <- NULL
+  for (k in 1:FOLDS) {
+    test <- raw[fold == k, ]
+    ys   <- c(ys, as.character(test[[TARGET]]))
+    Ps   <- rbind(Ps, fit_predict(model, raw[fold != k, ], test))
+  }
+  list(y = factor(ys, levels = CLASSES), P = Ps)
+}
+
+run_cv <- function(model) {
+  if (HAS_TIME) run_sliding(model, raw, from = min(raw$.day) + WINDOW, to = max(raw$.day)) else run_kfold(model)
+}
+
+# a table of the scores, the best LogLoss first
+score_table <- function(preds) {
+  tab <- t(sapply(preds, function(p) metrics(p$y, p$P)))
+  tab[order(tab[, "LogLoss"]), ]
+}
+```
+
+```{r b-cv-run}
+if (HAS_TIME) stopifnot("raw has fewer days than WINDOW: lower WINDOW in the settings" = as.numeric(max(raw$.day) - min(raw$.day)) > WINDOW)
+n_fallback <- 0
+cv_pred <- list()
+for (m in MODELS) { cv_pred[[m]] <- run_cv(m); cat(m, "") }       # (this takes a while: one fit for every model and every block)
+cat("\nfits that fell back to the baseline:", n_fallback, "\n")
+
+cv_table <- score_table(cv_pred)
+round(cv_table, 3)
+```
+
+```{r b-cv-plot}
+# the LogLoss of every model (smaller is better)
+cv_df <- data.frame(model = rownames(cv_table), LogLoss = cv_table[, "LogLoss"])
+ggplot(cv_df, aes(x = reorder(model, LogLoss), y = LogLoss)) +
+  geom_col() + labs(x = "model", y = "LogLoss", title = "Moving window: LogLoss of every model")
+
+# the confusion matrix of the best model (the rows are the actual class, the columns the predicted class)
+best <- rownames(cv_table)[1]
+cat("best model:", best, "\n")
+table(actual = cv_pred[[best]]$y, predicted = to_class(cv_pred[[best]]$P))
+```
+
+### B-9-1. The final model: the coefficients
+
+The model whose coefficients you want to read: write its name in `FINAL` (you decide: it is not chosen by a score). The model is the one fitted on all of `dat` in section B-8-2. It gives its `summary()` (logit, glmm, tree). lasso and ridge have no `summary()`: they give their coefficients (a lasso coefficient of exactly 0 = the variable is dropped).
+
+Reading an estimate (logit, glmm, lasso, ridge): one more unit of x multiplies the odds of the class by `exp(estimate)` (two classes: the odds of the second class; several classes: each class against the first one).
+
+```{r b-final-model}
+FINAL <- "logit"   # <-- YOUR DECISION: logit | lasso | ridge | tree | glmm
+fit_final <- fits[[FINAL]]$fit
+if (FINAL %in% c("lasso", "ridge")) coef(fit_final, s = "lambda.min") else summary(fit_final)   # lasso / ridge: the coefficients, the others: summary()
+```
+
+## B-10. The holdout (once)
+
+**Open the holdout only when the analysis above is finished.** Same rule as in section B-9: the models are trained on the last `WINDOW` days before every block of `TEST_DAYS` days of the holdout (the days of the holdout that are already past are used as training days, as in real life). Nothing is chosen with these numbers: they only tell how good the final model really is.
+
+```{r b-holdout}
+holdout <- readRDS("holdout.rds")
+if (exists("make_class")) holdout[[TARGET]] <- make_class(holdout)       # the example target: the SAME cut-offs as in raw
+holdout <- holdout[!is.na(holdout[[TARGET]]), ]
+holdout[[TARGET]] <- factor(holdout[[TARGET]], levels = CLASSES)         # the same classes as in raw
+
+n_fallback <- 0
+if (HAS_TIME) {
+  holdout$.day <- as.Date(holdout[[TIME]])
+  full <- rbind(raw, holdout)                                                   # raw followed by holdout
+  hold_pred <- lapply(MODELS, function(m) run_sliding(m, full, from = min(holdout$.day), to = max(holdout$.day)))
+} else {
+  hold_pred <- lapply(MODELS, function(m) list(y = holdout[[TARGET]], P = fit_predict(m, raw, holdout)))   # trained on all of raw
+}
+names(hold_pred) <- MODELS
+cat("fits that fell back to the baseline:", n_fallback, "\n")
+
+hold_table <- score_table(hold_pred)
+round(hold_table, 3)
+```
+
+```{r b-holdout-plot}
+# ===== The model to look at in the plots below: CHANGE HERE (it is not chosen by a score: you decide) =====
+BEST <- "logit"    # <-- YOUR DECISION: one of MODELS: baseline | logit | lasso | ridge | tree | glmm
+stopifnot("BEST must be one of the models of hold_pred" = BEST %in% names(hold_pred))
+# =========================================================================================================
+
+cat("model shown below:", BEST, "\n")
+table(actual = hold_pred[[BEST]]$y, predicted = to_class(hold_pred[[BEST]]$P))        # the confusion matrix of the model BEST
+
+if (BINARY) {
+  # ROC curves of every model on the holdout
+  roc_long <- do.call(rbind, lapply(MODELS, function(m) {
+    r <- pROC::roc(as.integer(hold_pred[[m]]$y == POSITIVE), hold_pred[[m]]$P[, POSITIVE], quiet = TRUE)
+    data.frame(model = m, fpr = 1 - r$specificities, tpr = r$sensitivities)
+  }))
+  ggplot(roc_long, aes(x = fpr, y = tpr, color = model)) +
+    geom_line() + geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(x = "false positive rate", y = "true positive rate", title = "Holdout: ROC curves")
+}
+
+# over time: the daily share of the class, actual vs estimated (the mean of the predicted probability) of the model BEST
+if (HAS_TIME) {
+  p <- hold_pred[[BEST]]
+  one_class <- function(k) {
+    actual    <- stats::aggregate(list(value = as.numeric(p$y == k)), by = list(day = p$day), FUN = base::mean)
+    estimated <- stats::aggregate(list(value = p$P[, k]),             by = list(day = p$day), FUN = base::mean)
+    rbind(data.frame(actual,    class = k, what = "actual"),
+          data.frame(estimated, class = k, what = "estimated"))
+  }
+  daily <- do.call(rbind, lapply(if (BINARY) POSITIVE else CLASSES, one_class))     # two classes: only the positive one (the other is 1 minus it)
+  ggplot(daily, aes(x = day, y = value, color = what)) +
+    geom_line() + facet_wrap(~ class) +
+    labs(x = "day", y = "daily share of the class", title = paste("Holdout over time:", BEST))
+}
+```
